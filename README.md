@@ -72,6 +72,42 @@ unrestricted.
 provider per profile name, so a second name is the only way to have both harnesses
 live in one session. Delegate by name from the supervisor.
 
+## Cross-review of a pull request
+
+```sh
+./cao review 123              # repo defaults to the only one in ~/workspace
+./cao review 123 my-repo
+```
+
+Claude and Codex review the same diff independently, then judge each other's
+findings, and a Claude arbiter writes the report.
+
+```
+gh fetch  →  Round 1: claude ∥ codex  →  normalize + dedup  →
+             Round 2: each judges the OTHER's findings  →  arbiter
+```
+
+The point is the disagreement. A finding both harnesses reported independently is
+already cross-confirmed and skips round 2; the contested remainder is what round 2
+adjudicates, and the report is ranked by that.
+
+Artifacts land in `~/workspace/.cao-review/<repo>/pr-<n>/` — outside the repo, so a
+review never dirties the git tree. `final-review.md` is the report; `round1/*.json`,
+`merged.json` and `round2/*.json` are kept for debugging the pipeline itself.
+
+Run it directly for more control:
+
+```sh
+./cao shell
+  cao workflow run pr_cross_review --run-id my-id --wait --json \
+    --input pr=123 --input repo_dir=/home/cao/workspace/my-repo
+  cao workflow status my-id       # progress
+  cao workflow resume my-id       # after an interruption
+```
+
+The workflow script lives at `workflows/pr_cross_review.py` and is synced into the
+container on every start, so editing it plus `./cao up` ships a new version.
+
 ## Notes and constraints
 
 - **The server has no authentication.** Port 9889 is published to `127.0.0.1`

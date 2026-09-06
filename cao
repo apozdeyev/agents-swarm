@@ -16,6 +16,7 @@ usage: ./cao <command>
   login-claude      interactive Claude Code login
   shell             bash shell inside the container
   launch [args]     start a supervisor session (passes args to `cao launch`)
+  review <pr> [repo] cross-review a PR with Claude and Codex
   ui                open the web UI
   logs              follow the server log
   status            container health and login state
@@ -40,6 +41,16 @@ case "$cmd" in
   shell)  docker compose exec "$C" bash ;;
   logs)   docker compose logs -f "$C" ;;
   ui)     open http://localhost:9889 ;;
+  review)
+    pr="${1:-}"; repo="${2:-}"
+    [ -z "$pr" ] && { echo "usage: ./cao review <pr-number> [repo-name]" >&2; exit 1; }
+    if [ -z "$repo" ]; then
+      repo=$(docker compose exec -T "$C" sh -c 'ls /home/cao/workspace | head -1' | tr -d '\r')
+      [ -z "$repo" ] && { echo "no repo in ~/workspace; clone one via ./cao shell" >&2; exit 1; }
+    fi
+    docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
+    docker compose exec -T "$C" cao workflow run pr_cross_review --wait --json \
+      --input "pr=$pr" --input "repo_dir=/home/cao/workspace/$repo" ;;
   launch)
     docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
     docker compose exec "$C" cao launch --agents code_supervisor "$@" ;;

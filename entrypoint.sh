@@ -20,6 +20,14 @@ if [ -n "${GIT_USER_NAME:-}" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then
   git config --global user.email "$GIT_USER_EMAIL"
 fi
 
+# WORKFLOW_SPEC_DIR is $CAO_HOME_DIR/workflows, which lives on the state volume.
+# Sync from the image on every start so a rebuild ships new workflow versions.
+mkdir -p "$CAO_HOME_DIR/workflows"
+for wf in /opt/cao/workflows/*.py; do
+  [ -e "$wf" ] || continue
+  cp -f "$wf" "$CAO_HOME_DIR/workflows/"
+done
+
 # Runs on every start, not just bootstrap: repos cloned since last boot need
 # their trust flag too, or the harness exits on launch.
 cao-trust /home/cao/workspace /home/cao/workspace/*/

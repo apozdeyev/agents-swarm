@@ -52,6 +52,7 @@ RUN mkdir -p /opt/cao \
     && echo '{"hasCompletedOnboarding": true}' > /opt/cao/claude.json.template \
     && chmod 644 /opt/cao/claude.json.template
 COPY profiles/ /opt/cao/profiles/
+COPY workflows/ /opt/cao/workflows/
 COPY bin/cao-trust /usr/local/bin/cao-trust
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/cao-trust
