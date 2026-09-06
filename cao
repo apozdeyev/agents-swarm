@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Host wrapper for the containerized CAO stack.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+C="cao"   # service and container name
+
+usage() {
+  cat <<'USAGE'
+usage: ./cao <command>
+
+  up                start the stack (builds on first run)
+  down              stop the stack (volumes and logins survive)
+  login-gh          interactive GitHub login (also wires up git credentials)
+  login-codex       interactive Codex login
+  login-claude      interactive Claude Code login
+  shell             bash shell inside the container
+  launch [args]     start a supervisor session (passes args to `cao launch`)
+  ui                open the web UI
+  logs              follow the server log
+  status            container health and login state
+USAGE
+}
+
+wait_healthy() {
+  printf 'waiting for cao-server '
+  for _ in $(seq 1 60); do
+    if [ "$(docker inspect -f '{{.State.Health.Status}}' "$C" 2>/dev/null)" = "healthy" ]; then
+      echo " ok -> http://localhost:9889"; return 0
+    fi
+    printf '.'; sleep 2
+  done
+  echo " timed out"; docker compose logs --tail 40 "$C"; return 1
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  up)     docker compose up -d --build && wait_healthy ;;
+  down)   docker compose down ;;
+  shell)  docker compose exec "$C" bash ;;
+  logs)   docker compose logs -f "$C" ;;
+  ui)     open http://localhost:9889 ;;
+  launch)
+    docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
+    docker compose exec "$C" cao launch --agents code_supervisor "$@" ;;
+  login-gh)     docker compose exec "$C" sh -c 'gh auth login && gh auth setup-git' ;;
+  login-codex)  docker compose exec "$C" codex login ;;
+  login-claude) docker compose exec "$C" claude ;;
+  login)
+    echo "no combined login: use ./cao login-gh, ./cao login-codex or ./cao login-claude" >&2
+    exit 1 ;;
+  status)
+    docker compose ps
+    docker compose exec -T "$C" sh -c '
+      echo "user:   $(id -un) (uid $(id -u))"
+      echo "tmux:   $(tmux -V)"
+      echo "claude: $(test -f ~/.claude/.credentials.json && echo authenticated || echo "NOT logged in")"
+      echo "codex:  $(test -f ~/.codex/auth.json && echo authenticated || echo "NOT logged in")"
+      echo "gh:     $(gh auth status >/dev/null 2>&1 && echo authenticated || echo "NOT logged in")"' ;;
+  *) usage; [ -z "$cmd" ] && exit 0 || exit 1 ;;
+esac

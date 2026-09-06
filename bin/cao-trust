@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Pre-accept Claude Code's per-directory trust dialog for the given paths.
+
+A fresh container has no trust record for any path, so `claude` opens a blocking
+"Do you trust the files in this folder?" prompt with "No, exit" preselected.
+Claude then exits, CAO never sees a REPL, and `cao launch` dies on a read timeout.
+Inside this container the sandbox *is* the boundary, so the prompt is pure noise.
+"""
+import json
+import os
+import sys
+
+CONFIG = os.path.expanduser("~/.claude.json")
+
+try:
+    with open(CONFIG) as fh:
+        cfg = json.load(fh)
+except (FileNotFoundError, ValueError):
+    cfg = {}
+
+cfg.setdefault("hasCompletedOnboarding", True)
+projects = cfg.setdefault("projects", {})
+
+changed = False
+for raw in sys.argv[1:]:
+    if not os.path.isdir(raw):
+        continue
+    entry = projects.setdefault(os.path.realpath(raw), {})
+    if not entry.get("hasTrustDialogAccepted"):
+        entry["hasTrustDialogAccepted"] = True
+        changed = True
+
+if changed:
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)

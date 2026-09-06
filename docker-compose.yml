@@ -1,0 +1,47 @@
+services:
+  cao:
+    build:
+      context: .
+      args:
+        CAO_VERSION: "2.5.0"
+        CLAUDE_VERSION: "2.1.260"
+        CODEX_VERSION: "0.153.2"
+    image: cao:dev
+    container_name: cao
+    init: true                          # reap orphaned tmux/node children
+    ports:
+      - "127.0.0.1:9889:9889"           # loopback only: cao-server has no request auth
+    environment:
+      CAO_HOME_DIR: /home/cao/.cao
+      # Bind address for cao-server only. Must NOT be CAO_API_HOST: the CLI reuses
+      # that var as its client URL and would then be rejected by TrustedHostMiddleware.
+      CAO_BIND_HOST: "0.0.0.0"
+      CAO_API_PORT: "9889"
+      # TrustedHostMiddleware rejects non-loopback Host headers even when bound to 0.0.0.0.
+      CAO_ALLOWED_HOSTS: "localhost,127.0.0.1"
+      # The websocket peer is the docker bridge gateway, never loopback.
+      # Safe to leave open because the port is published to 127.0.0.1 only.
+      CAO_WS_ALLOWED_CLIENTS: "*"
+      # Agents clone and edit inside the container; git refuses to commit without an identity.
+      GIT_USER_NAME: "apozdeyev"
+      GIT_USER_EMAIL: "anatoliy.pozdeyev@gmail.com"
+    volumes:
+      - cao-state:/home/cao/.cao        # sqlite, logs, agent-store, skills
+      - claude-auth:/home/cao/.claude   # .credentials.json
+      - codex-auth:/home/cao/.codex     # auth.json, config.toml
+      - gh-auth:/home/cao/.config/gh    # hosts.yml
+      - workspace:/home/cao/workspace   # cloned repos
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9889/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  cao-state:
+  claude-auth:
+  codex-auth:
+  gh-auth:
+  workspace:
