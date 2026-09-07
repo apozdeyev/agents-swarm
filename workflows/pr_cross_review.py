@@ -171,8 +171,10 @@ round1 = {key: found for key, found, _ in _r1}
 failures = {key: err for key, _, err in _r1 if err}
 
 if len(failures) == len(HARNESSES):
+    # Exit non-zero so the run is recorded FAILED. Exiting 0 here would file a run in
+    # which nothing was reviewed as `completed`, and `./cao review` would return success.
     emit_output({"pr": PR, "error": "both harnesses failed in round 1", "failures": failures})
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 # --- stage 1: normalize and dedup ------------------------------------------------
 # Python first: same file, same category, lines within 3 is the same finding.
