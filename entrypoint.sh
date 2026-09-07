@@ -32,6 +32,24 @@ done
 # their trust flag too, or the harness exits on launch.
 cao-trust /home/cao/workspace /home/cao/workspace/*/
 
+# Same reasoning as the workflow sync above, and NOT inside the bootstrap guard:
+# the sentinel survives on cao-state, so a profile added to the image after the
+# first boot would never be installed. `cao install` is idempotent (re-installing
+# an existing profile exits 0 and overwrites), so re-running it every start is safe.
+# Profiles no longer share one provider (codex twins plus the opencode twin), so read
+# it from each file's frontmatter. A profile with no provider: is a bug, not a default
+# -- fail loudly rather than silently installing it against the wrong harness.
+for profile in /opt/cao/profiles/*.md; do
+  [ -e "$profile" ] || continue
+  prov=$(sed -n 's/^provider:[[:space:]]*\([A-Za-z_][A-Za-z_0-9]*\).*/\1/p' "$profile" | head -1)
+  if [ -z "$prov" ]; then
+    echo "[entrypoint] $profile has no 'provider:' in frontmatter" >&2
+    exit 1
+  fi
+  echo "[entrypoint] installing $(basename "$profile" .md) ($prov)"
+  cao install "$profile" --provider "$prov"
+done
+
 SENTINEL="$CAO_HOME_DIR/.bootstrap-complete"
 
 if [ ! -f "$SENTINEL" ]; then
@@ -54,12 +72,6 @@ if not re.search(r'^provider:', text, re.M):
     text = re.sub(r'^(name: .*)$', r'\1\nprovider: claude_code', text, count=1, flags=re.M)
     open(path, 'w').write(text)
 PY
-  done
-
-  for profile in /opt/cao/profiles/*.md; do
-    [ -e "$profile" ] || continue
-    echo "[entrypoint] installing $(basename "$profile" .md) (codex)"
-    cao install "$profile" --provider codex
   done
 
   # Written last: any failure above aborts under `set -e`, leaving no sentinel,

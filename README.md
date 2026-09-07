@@ -1,7 +1,8 @@
 # agents-swarm — CAO in an isolated container
 
 Runs [CAO](https://github.com/awslabs/cli-agent-orchestrator) (`cli-agent-orchestrator`)
-in Docker, driving **Claude Code** and **Codex** as harnesses.
+in Docker, driving **Claude Code**, **Codex** and **OpenCode** (DeepSeek V4 Pro)
+as harnesses.
 
 ## Why
 
@@ -68,9 +69,33 @@ unrestricted.
 ## Agents
 
 `code_supervisor`, `developer`, `reviewer`, `memory_manager` run on **Claude Code**.
-`developer_codex`, `reviewer_codex` are twins running on **Codex** — CAO stores one
-provider per profile name, so a second name is the only way to have both harnesses
-live in one session. Delegate by name from the supervisor.
+`developer_codex`, `reviewer_codex` are twins running on **Codex**, and
+`reviewer_opencode` is a third twin on **OpenCode** pinned to DeepSeek V4 Pro — CAO
+stores one provider per profile name, so a second name is the only way to have both
+harnesses live in one session. Delegate by name from the supervisor.
+
+Profiles are installed from `/opt/cao/profiles/` on **every** container start, not
+just the first: the bootstrap sentinel lives on the `cao-state` volume, so a profile
+added to the image later would otherwise never be installed. `cao install` is
+idempotent, and each profile's harness comes from its own `provider:` frontmatter.
+
+### OpenCode / DeepSeek
+
+Unlike Claude, Codex and `gh`, OpenCode has no interactive login. It enables the
+`deepseek` provider from `DEEPSEEK_API_KEY` in the environment, read from `.env`
+(gitignored) via compose:
+
+```sh
+echo 'DEEPSEEK_API_KEY=sk-...' > .env   # from https://platform.deepseek.com/
+./cao up
+./cao status                            # shows whether the key reached the container
+```
+
+The model is pinned in the profile frontmatter (`model: deepseek/deepseek-v4-pro`);
+a workflow step can override it per step. A DeepSeek account with a zero balance
+authenticates fine and then fails inside the TUI with `Insufficient Balance` rather
+than an auth error — check `https://api.deepseek.com/user/balance` if a step times
+out with no visible cause.
 
 ## Cross-review of a pull request
 

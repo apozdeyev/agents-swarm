@@ -14,6 +14,7 @@ usage: ./cao <command>
   login-gh          interactive GitHub login (also wires up git credentials)
   login-codex       interactive Codex login
   login-claude      interactive Claude Code login
+                    (opencode/DeepSeek needs no login: set DEEPSEEK_API_KEY in .env)
   shell             bash shell inside the container
   launch [args]     start a supervisor session (passes args to `cao launch`)
   review <pr> [repo] cross-review a PR with Claude and Codex
@@ -67,6 +68,7 @@ case "$cmd" in
       echo "tmux:   $(tmux -V)"
       echo "claude: $(test -f ~/.claude/.credentials.json && echo authenticated || echo "NOT logged in")"
       echo "codex:  $(test -f ~/.codex/auth.json && echo authenticated || echo "NOT logged in")"
-      echo "gh:     $(gh auth status >/dev/null 2>&1 && echo authenticated || echo "NOT logged in")"' ;;
+      echo "gh:     $(gh auth status >/dev/null 2>&1 && echo authenticated || echo "NOT logged in")"
+      echo "opencode: $(test -n "${DEEPSEEK_API_KEY:-}" && echo "DEEPSEEK_API_KEY present" || echo "DEEPSEEK_API_KEY MISSING")"' ;;
   *) usage; [ -z "$cmd" ] && exit 0 || exit 1 ;;
 esac
