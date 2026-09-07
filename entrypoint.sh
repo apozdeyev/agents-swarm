@@ -50,6 +50,34 @@ for profile in /opt/cao/profiles/*.md; do
   cao install "$profile" --provider "$prov"
 done
 
+# OpenCode enforces a workspace boundary of its own, entirely separate from CAO's
+# allowed_tools: CAO translates allowed_tools into the agent's `permission:` frontmatter,
+# which carries no `external_directory` key, so OpenCode falls back to its default of
+# prompting. Nothing answers that prompt from a workflow step, so the step burns its whole
+# timeout and fails with a 504 and no visible cause.
+#
+# Review artifacts live outside the repo by design, and agents also invent their own
+# scratch paths under /tmp, so a targeted allowlist cannot cover this -- every miss costs a
+# full step timeout. Allow the lot. This is not a loosening: CAO already runs Claude with
+# --dangerously-skip-permissions and Codex with --yolo, and the security boundary is the
+# container, which has no host bind mounts and runs non-root.
+#
+# Written after the installs because `cao install` creates the file. CAO's helper is
+# read-modify-write and preserves top-level keys it does not own.
+python3 - <<'OCPERM'
+import json
+import os
+
+path = "/home/cao/.aws/opencode/opencode.json"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+cfg = {"$schema": "https://opencode.ai/config.json"}
+if os.path.exists(path):
+    cfg = json.load(open(path))
+cfg.setdefault("permission", {})["external_directory"] = {"*": "allow"}
+with open(path, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+OCPERM
+
 SENTINEL="$CAO_HOME_DIR/.bootstrap-complete"
 
 if [ ! -f "$SENTINEL" ]; then

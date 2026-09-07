@@ -1,10 +1,11 @@
-"""pr_cross_review - two harnesses review a PR, then judge each other's findings.
+"""pr_cross_review - three harnesses review a PR, then judge each other's findings.
 
-Round 1 fans out Claude and Codex over the same diff. Findings are normalized and
-deduped, and provenance is kept: a finding both harnesses reported independently is
-already cross-confirmed and skips round 2. The contested remainder is cross-validated
--- Claude judges Codex's findings and vice versa -- and a Claude arbiter writes the
-final report.
+Round 1 fans out Claude, Codex and OpenCode/DeepSeek over the same diff. Findings are
+normalized and deduped, and provenance is kept: a finding two or more harnesses
+reported independently is already cross-confirmed and skips round 2. The contested
+remainder goes to a full jury -- every harness judges the findings of both others, so
+each contested finding collects two independent verdicts and a disagreement between
+them is itself a signal. A Claude arbiter writes the final report.
 
 Determinism note: resume re-executes this file top-to-bottom, so every path derives
 from the inputs and nothing here reads the clock or an RNG.
@@ -20,14 +21,14 @@ from cao_workflow import ShimError, ShimHTTPError, emit_output, get_inputs, step
 INPUTS = {
     "pr": {"type": "int", "required": True},
     "repo_dir": {"type": "path", "required": True},
-    "max_workers": {"type": "int", "required": False, "default": 2},
+    "max_workers": {"type": "int", "required": False, "default": 3},
     "step_timeout": {"type": "int", "required": False, "default": 900},
 }
 
 _inputs = get_inputs()
 PR = int(_inputs["pr"])
 REPO = str(_inputs["repo_dir"]).rstrip("/")
-MAX_WORKERS = int(_inputs.get("max_workers", 2))
+MAX_WORKERS = int(_inputs.get("max_workers", 3))
 TIMEOUT = float(_inputs.get("step_timeout", 900))
 
 # Outside the repo, so a review run never dirties the git tree.
@@ -48,8 +49,8 @@ CATEGORIES = ("correctness", "security", "performance", "maintainability", "test
 HARNESSES = (
     ("claude", "claude_code", "reviewer"),
     ("codex", "codex", "reviewer_codex"),
+    ("opencode", "opencode_cli", "reviewer_opencode"),
 )
-OTHER = {"claude": "codex", "codex": "claude"}
 
 os.makedirs(os.path.join(ART, "round1"), exist_ok=True)
 os.makedirs(os.path.join(ART, "round2"), exist_ok=True)
@@ -173,7 +174,7 @@ failures = {key: err for key, _, err in _r1 if err}
 if len(failures) == len(HARNESSES):
     # Exit non-zero so the run is recorded FAILED. Exiting 0 here would file a run in
     # which nothing was reviewed as `completed`, and `./cao review` would return success.
-    emit_output({"pr": PR, "error": "both harnesses failed in round 1", "failures": failures})
+    emit_output({"pr": PR, "error": "every harness failed in round 1", "failures": failures})
     raise SystemExit(1)
 
 # --- stage 1: normalize and dedup ------------------------------------------------
@@ -207,7 +208,7 @@ if len([f for f in deduped if len(f["sources"]) == 1]) > 1:
         [{k: f[k] for k in ("id", "sources", "file", "line", "category", "title", "detail")}
          for f in deduped], indent=2))
     merge_prompt = (
-        "The JSON array at %s holds code-review findings from two independent reviewers. "
+        "The JSON array at %s holds code-review findings from three independent reviewers. "
         "Each carries a `sources` field naming which reviewer produced it.\n\n"
         "Find groups that describe THE SAME underlying defect in different words. Only group "
         "findings from DIFFERENT sources -- never merge two findings from the same reviewer. "
@@ -243,22 +244,24 @@ if len([f for f in deduped if len(f["sources"]) == 1]) > 1:
 
 for f in deduped:
     f["sources"] = sorted(f["sources"])
-    # Found independently by both harnesses: that IS the cross-confirmation round 2 exists
-    # to produce, so it is confirmed here and skips validation.
+    # Found independently by two or more harnesses: that IS the cross-confirmation round 2
+    # exists to produce, so it is confirmed here and skips validation. Two of three
+    # agreeing is stronger evidence than two of two was -- the finding had a real chance
+    # to go uncorroborated and did not.
     f["corroborated"] = len(f["sources"]) > 1
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
 
 if not deduped:
     open(FINAL, "w").write(
-        "# PR #%d cross-review\n\nNo findings. Claude and Codex both reviewed the diff "
-        "and neither reported a defect.\n" % PR)
+        "# PR #%d cross-review\n\nNo findings. Claude, Codex and OpenCode each reviewed "
+        "the diff and none reported a defect.\n" % PR)
     emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures})
     raise SystemExit(0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
 R2_PROMPT = (
-    "You are adjudicating code-review findings produced by a DIFFERENT reviewer on pull "
-    "request #%d of the repository at %s.\n\n"
+    "You are adjudicating code-review findings produced by OTHER reviewers on pull "
+    "request #%d of the repository at %s. None of them are yours.\n\n"
     "The findings to judge are in the JSON array at %s. The diff under review is at %s. "
     "Read the actual code before ruling on anything.\n\n"
     "For each finding decide:\n"
@@ -276,19 +279,25 @@ R2_PROMPT = (
 
 
 def _validate(spec):
-    """`key` is the judge; it validates findings the OTHER harness produced."""
+    """`key` is the judge; it validates every finding the other harnesses produced.
+
+    Full jury rather than a round-robin: a contested finding is judged by both of the
+    harnesses that did not report it, so it ends up with two independent verdicts and
+    the judges are free to disagree. One step per judge, not one per (judge, subject)
+    pair -- the judge reads all foreign findings at once, which keeps round 2 at
+    len(HARNESSES) steps instead of len(HARNESSES) * (len(HARNESSES) - 1).
+    """
     key, provider, agent = spec
-    subject = OTHER[key]
-    targets = [f for f in deduped if not f["corroborated"] and f["sources"] == [subject]]
+    targets = [f for f in deduped if not f["corroborated"] and f["sources"] != [key]]
     if not targets:
         return key, {}, None
     infile = os.path.join(ART, "round2", "to-judge-by-%s.json" % key)
-    outfile = os.path.join(ART, "round2", "%s-validates-%s.json" % (key, subject))
+    outfile = os.path.join(ART, "round2", "%s-verdicts.json" % key)
     open(infile, "w").write(json.dumps(targets, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
     try:
         step(provider, agent, prompt,
-             recovery="idempotent", step_id="r2-%s-judges-%s" % (key, subject),
+             recovery="idempotent", step_id="r2-%s-jury" % key,
              timeout=TIMEOUT, working_directory=REPO, allowed_tools=WRITE_TOOLS)
     except ShimHTTPError as exc:
         if getattr(exc, "status", None) == 409:
@@ -303,35 +312,53 @@ def _validate(spec):
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
     _r2 = list(pool.map(_validate, sorted(HARNESSES)))
 
+for finding in deduped:
+    finding["verdicts"] = {}
+
 for key, verdicts, err in _r2:
     if err:
         failures["r2-%s" % key] = err
     for finding in deduped:
         if finding["id"] in verdicts:
-            finding["verdict"] = verdicts[finding["id"]]
+            finding["verdicts"][key] = verdicts[finding["id"]]
 
 for finding in deduped:
     if finding["corroborated"]:
-        finding["verdict"] = {
+        finding["verdicts"]["corroboration"] = {
             "verdict": "confirmed",
-            "reasoning": "Reported independently by both harnesses in round 1.",
+            "reasoning": "Reported independently by %d of %d harnesses in round 1." % (
+                len(finding["sources"]), len(HARNESSES)),
             "corrected_severity": finding["severity"],
         }
+    # With two judges per contested finding the jury can disagree, and that disagreement
+    # is information the two-harness version could not produce: it marks a finding whose
+    # reality is genuinely unsettled, not one that is simply confirmed or simply wrong.
+    rulings = {(v or {}).get("verdict") for v in finding["verdicts"].values()}
+    if not rulings:
+        finding["ruling"] = "unjudged"
+    elif len(rulings) == 1:
+        finding["ruling"] = rulings.pop()
+    else:
+        finding["ruling"] = "split"
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
 
 # --- stage 3: arbiter ------------------------------------------------------------
 ARBITER_PROMPT = (
     "Write the final review for pull request #%d of the repository at %s.\n\n"
     "The adjudicated findings are in the JSON array at %s. Each has `sources` (which "
-    "harness reported it), `corroborated` (true when both did, independently), and a "
-    "`verdict` from the opposing harness. The diff is at %s and PR metadata at %s.\n\n"
+    "harnesses reported it), `corroborated` (true when two or more did, independently), "
+    "`verdicts` keyed by judging harness, and `ruling` summarising them. Three harnesses "
+    "ran: Claude, Codex and OpenCode/DeepSeek. The diff is at %s and PR metadata at %s.\n\n"
     "Resolve the material: drop rejected findings unless the rejection is plainly wrong "
     "(say so if you overrule one), rank what survives by real severity rather than by the "
     "label it carries, and lead with anything that would break in production. Corroborated "
-    "findings are the strongest signal in the set -- two models found them independently. "
-    "Findings marked needs-context belong in a separate short section, not the main list.\n\n"
+    "findings are the strongest signal in the set -- two or more models found them "
+    "independently. A `ruling` of `split` means the two judges disagreed: do not average "
+    "them, read the code and say which judge is right and why. Findings marked "
+    "needs-context belong in a separate short section, not the main list.\n\n"
     "Write Markdown to %s: a two-sentence verdict on the PR, then the findings as sections "
-    "with file:line, what breaks, and the fix. State which harness found each one. If any "
+    "with file:line, what breaks, and the fix. State which harness found each one, and "
+    "which judged it. If any "
     "harness or stage failed, say so plainly -- this JSON records it: %s\n\n"
     "Be concise and concrete. Reply with just the path when the file is written."
 )
@@ -354,6 +381,7 @@ emit_output({
     "round1": {k: len(v) for k, v in round1.items()},
     "after_dedup": len(deduped),
     "corroborated": len([f for f in deduped if f["corroborated"]]),
-    "confirmed": len([f for f in deduped if (f.get("verdict") or {}).get("verdict") == "confirmed"]),
+    "confirmed": len([f for f in deduped if f["ruling"] == "confirmed"]),
+    "split": len([f for f in deduped if f["ruling"] == "split"]),
     "failures": failures,
 })

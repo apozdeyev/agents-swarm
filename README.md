@@ -92,7 +92,14 @@ echo 'DEEPSEEK_API_KEY=sk-...' > .env   # from https://platform.deepseek.com/
 ```
 
 The model is pinned in the profile frontmatter (`model: deepseek/deepseek-v4-pro`);
-a workflow step can override it per step. A DeepSeek account with a zero balance
+a workflow step can override it per step.
+
+OpenCode also has a workspace boundary that CAO does not drive: `allowed_tools` becomes
+the agent's `permission:` frontmatter, which has no `external_directory` key, so any path
+outside the step's working directory raises a prompt no workflow step can answer and the
+step dies on its timeout with a bare 504. The entrypoint therefore allows
+`external_directory` outright in `opencode.json`, matching the freedom Claude and Codex
+already have here. A DeepSeek account with a zero balance
 authenticates fine and then fails inside the TUI with `Insufficient Balance` rather
 than an auth error — check `https://api.deepseek.com/user/balance` if a step times
 out with no visible cause.
