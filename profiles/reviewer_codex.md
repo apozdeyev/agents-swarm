@@ -7,6 +7,14 @@ role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained 
 # orchestration skills. An empty filter advertises none, which drops 4873 chars
 # of catalog from a 8234-char system prompt (measured, not estimated).
 skills: []
+# Codex reviewed a 1228-line diff in 65 seconds and reported nothing, while the other
+# two harnesses spent seven minutes each on the same diff and found four defects apiece.
+# It is already on gpt-6-astra, the strongest model it offers, so the shortfall is
+# effort, not capability -- and effort is the one knob that was never set. codexConfig
+# becomes `-c <key>=<value>` at launch, so this needs no global ~/.codex/config.toml.
+# Accepted values are low, medium, high and xhigh; a wrong one is rejected outright.
+codexConfig:
+  model_reasoning_effort: high
 tags:
   - review
   - code-review
