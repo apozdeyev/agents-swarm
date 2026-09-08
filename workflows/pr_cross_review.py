@@ -257,10 +257,23 @@ SEVERITY_RUBRIC = (
     "  low      - everything else\n"
 )
 
+# Codex at high effort reached for `cargo test` unprompted and lost the round to
+# `cargo: command not found`, the same way it lost one to a missing `rg` before. The
+# container carries no compiler at all -- verified: cargo, rustc, gcc, cc, make, go and
+# javac are all absent, and so is any project test runner. Saying so up front costs a
+# sentence; discovering it costs a tool call and, on the evidence, sometimes the step.
+ENVIRONMENT_NOTE = (
+    "This container has no compiler or build toolchain: cargo, rustc, gcc, make and go "
+    "are not installed, and neither is the project's test runner. python3, node, git, gh "
+    "and rg are. So review statically -- read the code rather than trying to build or "
+    "run it.\n\n"
+)
+
 R1_PROMPT = (
     "You are reviewing pull request #%d of the repository at %s.\n\n"
     "The unified diff is at %s and the PR metadata (title, body, changed files) is at %s. "
     "Read both. You may read any file in the repository for context.\n\n"
+    + ENVIRONMENT_NOTE +
     "Report only defects you can point at in the diff: correctness bugs, security issues, "
     "resource and performance problems, missing test coverage for changed behaviour, and "
     "maintainability problems severe enough to act on. Do not report style preferences, and "
@@ -397,6 +410,7 @@ R2_PROMPT = (
     "request #%d of the repository at %s. None of them are yours.\n\n"
     "The findings to judge are in the JSON array at %s. The diff under review is at %s. "
     "Read the actual code before ruling on anything.\n\n"
+    + ENVIRONMENT_NOTE +
     "For each finding decide:\n"
     "  confirmed     - the defect is real; the failure scenario holds\n"
     "  rejected      - it is wrong, already handled elsewhere, or not a defect\n"
