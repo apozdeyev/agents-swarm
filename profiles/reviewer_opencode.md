@@ -4,6 +4,12 @@ provider: opencode_cli
 model: deepseek/deepseek-v4-pro
 description: Code Reviewer Agent in a multi-agent system (OpenCode harness, DeepSeek V4 Pro)
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
+# Same empty filter as the codex twin, for consistency, but it changes nothing
+# here: the opencode adapter never reads profile.skills. OpenCode discovers the
+# same skills natively through the ~/.aws/opencode/skills -> ~/.cao/skills symlink
+# that cao install creates unconditionally. Filtering those would mean fighting
+# the installer on every start, which is not worth it for prompt noise.
+skills: []
 tags:
   - review
   - code-review

@@ -3,6 +3,10 @@ name: reviewer_codex
 provider: codex
 description: Code Reviewer Agent in a multi-agent system (Codex harness)
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
+# None of CAO's installed skills are about code review -- they are its own
+# orchestration skills. An empty filter advertises none, which drops 4873 chars
+# of catalog from a 8234-char system prompt (measured, not estimated).
+skills: []
 tags:
   - review
   - code-review

@@ -132,6 +132,23 @@ FINDING_SHAPE = (
     '"confidence": "high|medium|low"}]}'
 )
 
+# One scale for both rounds. Without it every harness applies its own threshold and
+# the `corrected_severity` values are not comparable -- a `split` then records a
+# difference in calibration rather than a disagreement about the code. Phrased by
+# consequence, not by project: what makes a defect critical is that its effect cannot
+# be taken back, whatever the codebase does.
+SEVERITY_RUBRIC = (
+    "Rate severity on this scale, not your own:\n"
+    "  critical - can cause a wrong or duplicated irreversible side effect (an order\n"
+    "             placed, money moved, data destroyed), or silently corrupt state that\n"
+    "             is later acted on\n"
+    "  high     - can crash, hang or stall the process while it holds live state, or\n"
+    "             regresses the latency of a path this project treats as hot\n"
+    "  medium   - wrong behaviour off those paths, or data lost silently and only\n"
+    "             noticed later\n"
+    "  low      - everything else\n"
+)
+
 R1_PROMPT = (
     "You are reviewing pull request #%d of the repository at %s.\n\n"
     "The unified diff is at %s and the PR metadata (title, body, changed files) is at %s. "
@@ -141,7 +158,8 @@ R1_PROMPT = (
     "maintainability problems severe enough to act on. Do not report style preferences, and "
     "do not restate what the code does. Every finding needs a concrete failure scenario -- "
     "if you cannot say what input makes it go wrong, leave it out.\n\n"
-    "Write your findings as a single JSON object to %s, with exactly this shape:\n%s\n\n"
+    + SEVERITY_RUBRIC +
+    "\nWrite your findings as a single JSON object to %s, with exactly this shape:\n%s\n\n"
     "Write raw JSON only -- no code fences, no commentary in the file. An empty findings "
     "list is a valid and useful answer. When the file is written, reply with just its path."
 )
@@ -269,13 +287,40 @@ R2_PROMPT = (
     "  rejected      - it is wrong, already handled elsewhere, or not a defect\n"
     "  needs-context - it may be real but cannot be settled from this diff alone\n\n"
     "Judge the claim, not its wording, and do not be deferential: a finding you cannot "
-    "reproduce from the code in front of you is not confirmed. Where the severity is "
-    "miscalibrated, give a corrected one.\n\n"
+    "reproduce from the code in front of you is not confirmed. To reject one, name the "
+    "specific code that prevents the described scenario; being unable to reproduce it "
+    "is needs-context, not a rejection. Where the severity is miscalibrated, give a "
+    "corrected one.\n\n"
+    + SEVERITY_RUBRIC +
+    "\n"
     'Write to %s exactly: {"verdicts": [{"id": "<finding id>", '
     '"verdict": "confirmed|rejected|needs-context", "reasoning": "<why, citing the code>", '
     '"corrected_severity": "critical|high|medium|low"}]}\n'
     "Raw JSON only, no code fences. Include every finding. Reply with just the path."
 )
+
+
+# Everything else a finding carries names its author: the `claude-`/`codex-`/`opencode-`
+# prefix in `id`, the `sources` list, and `confidence` -- the reporter's own assessment
+# of itself. A judge who knows who wrote a claim, and how sure they were, is no longer
+# judging it independently, which is the one thing round 2 exists to do.
+JUDGE_FIELDS = ("file", "line", "severity", "category", "title", "detail", "failure_scenario")
+
+
+def _anonymize(targets):
+    """Return (payload for the judge, anonymous id -> real id).
+
+    Ids are positional over an already-deterministic list, so they are stable on resume.
+    Each judge gets its own numbering because each sees a different subset.
+    """
+    payload, id_map = [], {}
+    for position, finding in enumerate(targets, 1):
+        anon = "f-%02d" % position
+        id_map[anon] = finding["id"]
+        item = {"id": anon}
+        item.update({k: finding[k] for k in JUDGE_FIELDS})
+        payload.append(item)
+    return payload, id_map
 
 
 def _validate(spec):
@@ -291,9 +336,14 @@ def _validate(spec):
     targets = [f for f in deduped if not f["corroborated"] and f["sources"] != [key]]
     if not targets:
         return key, {}, None
+    payload, id_map = _anonymize(targets)
     infile = os.path.join(ART, "round2", "to-judge-by-%s.json" % key)
+    # Kept next to it so a run stays debuggable: the verdict file the judge writes is
+    # in anonymous ids, and this is the only record of what they stood for.
+    mapfile = os.path.join(ART, "round2", "to-judge-by-%s-map.json" % key)
     outfile = os.path.join(ART, "round2", "%s-verdicts.json" % key)
-    open(infile, "w").write(json.dumps(targets, indent=2))
+    open(infile, "w").write(json.dumps(payload, indent=2))
+    open(mapfile, "w").write(json.dumps(id_map, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
     try:
         step(provider, agent, prompt,
@@ -306,7 +356,16 @@ def _validate(spec):
     except ShimError as exc:
         return key, {}, str(exc)
     verdicts = (_read_json(outfile, {}) or {}).get("verdicts", [])
-    return key, {v.get("id"): v for v in verdicts if isinstance(v, dict)}, None
+    ruled = {}
+    for verdict in verdicts:
+        if not isinstance(verdict, dict):
+            continue
+        real_id = id_map.get(verdict.get("id"))
+        if real_id:
+            # Real id restored before anything downstream sees it: merged.json and the
+            # arbiter work in real ids, the anonymous ones exist only for the judge.
+            ruled[real_id] = dict(verdict, id=real_id)
+    return key, ruled, None
 
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:

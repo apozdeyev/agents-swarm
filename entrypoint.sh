@@ -108,4 +108,21 @@ PY
   echo "[entrypoint] bootstrap complete"
 fi
 
+# The stock `reviewer` is installed from CAO's own bundle, not /opt/cao/profiles, so it
+# cannot declare `skills:` the way the codex and opencode twins do. Without a filter the
+# whole skill catalog -- all of it CAO's orchestration skills, none about code review --
+# is appended to the system prompt of every Claude review step. Same python-patch shape
+# the bootstrap uses for `provider:`, but outside the guard so an already-bootstrapped
+# volume gets it too, and after it so the file is guaranteed to exist.
+python3 - "$CAO_HOME_DIR/agent-context/reviewer.md" <<'SKILLFILTER'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+if not re.search(r'^skills:', text, re.M):
+    text = re.sub(r'^(provider: .*)$', r'\1\nskills: []', text, count=1, flags=re.M)
+    open(path, 'w').write(text)
+SKILLFILTER
+
 exec cao-server --host "${CAO_BIND_HOST:-0.0.0.0}" --port "${CAO_API_PORT:-9889}"
