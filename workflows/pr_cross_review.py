@@ -132,10 +132,16 @@ def _norm(finding, source, index):
 
 
 def _load_round1(path, source):
-    data = _read_json(path, {})
+    """Findings from one harness, or None when it delivered no usable file.
+
+    An empty list and None are different answers. "I reviewed this and found nothing"
+    is a useful result the prompt explicitly invites; "the step ended without writing
+    anything" is a failure that used to be recorded as the former.
+    """
+    data = _read_json(path, None)
     items = data.get("findings") if isinstance(data, dict) else data
     if not isinstance(items, list):
-        return []
+        return None
     return [_norm(f, source, i + 1) for i, f in enumerate(items) if isinstance(f, dict)]
 
 
@@ -282,7 +288,14 @@ def _review(spec):
         return key, [], str(exc)
     except ShimError as exc:
         return key, [], str(exc)
-    return key, _load_round1(out, key), None
+    # A step can report `completed` without the work having happened -- the harnesses are
+    # driven through their TUI, and a judge has been seen cut short mid-reasoning, having
+    # written nothing, yet still coming back completed. So the difference between
+    # "reviewed, found nothing" and "never delivered" is read off the disk, not the state.
+    found = _load_round1(out, key)
+    if found is None:
+        return key, [], "no usable findings file at %s" % out
+    return key, found, None
 
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -467,6 +480,16 @@ def _validate(spec):
             # Real id restored before anything downstream sees it: merged.json and the
             # arbiter work in real ids, the anonymous ones exist only for the judge.
             ruled[real_id] = dict(verdict, id=real_id)
+    # Same reasoning as round 1, and this is where it actually bit: a jury step finished
+    # `completed` having written no verdict file, and an empty dict here is exactly what
+    # a judge with nothing to judge returns -- so the run reported no failure while a
+    # third of the jury never voted. Partial coverage is reported too, without throwing
+    # away the verdicts that did arrive.
+    if not ruled:
+        return key, {}, "judged none of %d findings: no usable verdicts at %s" % (
+            len(targets), outfile)
+    if len(ruled) < len(targets):
+        return key, ruled, "judged only %d of %d findings" % (len(ruled), len(targets))
     return key, ruled, None
 
 
