@@ -17,7 +17,9 @@ usage: ./cao <command>
                     (opencode/DeepSeek needs no login: set DEEPSEEK_API_KEY in .env)
   shell             bash shell inside the container
   launch [args]     start a supervisor session (passes args to `cao launch`)
-  review <pr> [repo] cross-review a PR with Claude and Codex
+  review <pr-url>   cross-review a PR with Claude, Codex and OpenCode
+  review <owner/name> <pr>
+                    same, given repo and number separately
   ui                open the web UI
   logs              follow the server log
   status            container health and login state
@@ -43,15 +45,22 @@ case "$cmd" in
   logs)   docker compose logs -f "$C" ;;
   ui)     open http://localhost:9889 ;;
   review)
-    pr="${1:-}"; repo="${2:-}"
-    [ -z "$pr" ] && { echo "usage: ./cao review <pr-number> [repo-name]" >&2; exit 1; }
-    if [ -z "$repo" ]; then
-      repo=$(docker compose exec -T "$C" sh -c 'ls /home/cao/workspace | head -1' | tr -d '\r')
-      [ -z "$repo" ] && { echo "no repo in ~/workspace; clone one via ./cao shell" >&2; exit 1; }
-    fi
-    docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
+    # The workflow clones and checks the PR out itself, so nothing needs to exist in
+    # ~/workspace first. URL parsing lives here and not in the workflow: the workflow's
+    # contract stays repo + number, and this is where a pasted link arrives.
+    usage_review() { echo "usage: ./cao review <pr-url> | <owner/name> <pr-number>" >&2; exit 1; }
+    a="${1:-}"; b="${2:-}"
+    [ -z "$a" ] && usage_review
+    case "$a" in
+      *github.com/*/pull/*)
+        repo=$(printf '%s' "$a" | sed -E 's#.*github\.com/([^/]+/[^/]+)/pull/([0-9]+).*#\1#')
+        pr=$(printf '%s' "$a" | sed -E 's#.*github\.com/([^/]+/[^/]+)/pull/([0-9]+).*#\2#') ;;
+      */*) repo="$a"; pr="$b" ;;
+      *)   usage_review ;;
+    esac
+    case "$pr" in ''|*[!0-9]*) usage_review ;; esac
     docker compose exec -T "$C" cao workflow run pr_cross_review --wait --json \
-      --input "pr=$pr" --input "repo_dir=/home/cao/workspace/$repo" ;;
+      --input "repo=$repo" --input "pr=$pr" ;;
   launch)
     docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
     docker compose exec "$C" cao launch --agents code_supervisor "$@" ;;

@@ -107,32 +107,59 @@ out with no visible cause.
 ## Cross-review of a pull request
 
 ```sh
-./cao review 123              # repo defaults to the only one in ~/workspace
-./cao review 123 my-repo
+./cao review https://github.com/owner/name/pull/123
+./cao review owner/name 123
 ```
 
-Claude and Codex review the same diff independently, then judge each other's
-findings, and a Claude arbiter writes the report.
+Any repository the logged-in `gh` account can read. Nothing needs to be cloned first:
+the workflow provisions the checkout itself.
+
+Claude, Codex and OpenCode/DeepSeek review the same diff independently, then sit as a
+jury over each other's findings, and a Claude arbiter writes the report.
 
 ```
-gh fetch  →  Round 1: claude ∥ codex  →  normalize + dedup  →
-             Round 2: each judges the OTHER's findings  →  arbiter
+clone + worktree at the PR head  →  Round 1: claude ∥ codex ∥ opencode  →
+    normalize + dedup  →  Round 2: each judges the other two  →  arbiter
 ```
 
-The point is the disagreement. A finding both harnesses reported independently is
-already cross-confirmed and skips round 2; the contested remainder is what round 2
-adjudicates, and the report is ranked by that.
+The point is the disagreement. A finding two or more harnesses reported independently
+is already cross-confirmed and skips round 2; the contested remainder is judged by both
+harnesses that did not report it, so a `split` marks a finding whose reality is
+genuinely unsettled. Findings reach the judges anonymised — no harness name, no
+reporter's own confidence — because a judge told who wrote a claim is not judging it
+independently.
 
-Artifacts land in `~/workspace/.cao-review/<repo>/pr-<n>/` — outside the repo, so a
-review never dirties the git tree. `final-review.md` is the report; `round1/*.json`,
-`merged.json` and `round2/*.json` are kept for debugging the pipeline itself.
+### The checkout
+
+Reviewing a diff while reading files from some other branch produces confident nonsense,
+so the pipeline owns the git state:
+
+```
+~/workspace/.cao-repos/<owner>__<name>.git        bare clone, one per repository
+~/workspace/.cao-worktrees/<owner>__<name>/pr-<n> detached at refs/pull/<n>/head
+~/workspace/.cao-review/<owner>__<name>/pr-<n>/   artifacts
+```
+
+`refs/pull/<n>/head` rather than the branch name: it resolves for merged and closed PRs
+and for PRs from forks. Worktrees of *other* PRs of the same repo are removed once their
+review has produced a `final-review.md`; the artifacts stay. Bare clones are never
+removed — cheap to keep, expensive to rebuild.
+
+Concurrent reviews work: paths are keyed by owner, name and PR number, and the git
+mutations are serialised per repository by a file lock. The real ceiling is provider
+rate limits — one run already holds three live model sessions.
+
+Artifacts sit outside the checkout, so a review never dirties the git tree.
+`final-review.md` is the report; `round1/*.json`, `merged.json`, `round2/*.json` and
+`round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
+debugging the pipeline itself.
 
 Run it directly for more control:
 
 ```sh
 ./cao shell
   cao workflow run pr_cross_review --run-id my-id --wait --json \
-    --input pr=123 --input repo_dir=/home/cao/workspace/my-repo
+    --input repo=owner/name --input pr=123
   cao workflow status my-id       # progress
   cao workflow resume my-id       # after an interruption
 ```

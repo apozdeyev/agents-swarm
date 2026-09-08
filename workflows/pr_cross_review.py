@@ -7,32 +7,64 @@ remainder goes to a full jury -- every harness judges the findings of both other
 each contested finding collects two independent verdicts and a disagreement between
 them is itself a signal. A Claude arbiter writes the final report.
 
+Takes a repository and a PR number and provisions the checkout itself: a bare clone per
+repository, a detached worktree per PR at refs/pull/<n>/head. Pointing the harnesses at
+an existing working copy is what this replaces -- that copy sits on whatever branch it
+was left on, so every file opened for context was the wrong version of itself.
+
 Determinism note: resume re-executes this file top-to-bottom, so every path derives
 from the inputs and nothing here reads the clock or an RNG.
 """
+import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 from cao_workflow import ShimError, ShimHTTPError, emit_output, get_inputs, step
 
 INPUTS = {
+    # "owner/name", or any GitHub URL containing it. The wrapper turns a PR URL into
+    # this plus `pr`, so nothing clever is needed here.
+    "repo": {"type": "string", "required": True},
     "pr": {"type": "int", "required": True},
-    "repo_dir": {"type": "path", "required": True},
     "max_workers": {"type": "int", "required": False, "default": 3},
     "step_timeout": {"type": "int", "required": False, "default": 900},
 }
 
 _inputs = get_inputs()
 PR = int(_inputs["pr"])
-REPO = str(_inputs["repo_dir"]).rstrip("/")
 MAX_WORKERS = int(_inputs.get("max_workers", 3))
 TIMEOUT = float(_inputs.get("step_timeout", 900))
 
-# Outside the repo, so a review run never dirties the git tree.
-ART = os.path.join("/home/cao/workspace/.cao-review", os.path.basename(REPO), "pr-%d" % PR)
+_repo_raw = str(_inputs["repo"]).strip().rstrip("/")
+if _repo_raw.endswith(".git"):
+    _repo_raw = _repo_raw[:-4]
+# ":" for scp-style remotes, so git@github.com:owner/name lands the same as a URL.
+_repo_parts = [p for p in _repo_raw.replace(":", "/").split("/") if p]
+# A pasted PR URL ends in .../pull/<n>[/files]. The wrapper strips that, but this script
+# is documented as directly runnable, and there the mistake costs a confusing
+# "Repository not found: pull/1" instead of a review.
+if "pull" in _repo_parts:
+    _repo_parts = _repo_parts[:_repo_parts.index("pull")]
+if len(_repo_parts) < 2:
+    raise SystemExit("repo must be owner/name or a github.com URL, got %r" % _inputs["repo"])
+OWNER, NAME = _repo_parts[-2], _repo_parts[-1]
+SLUG = "%s__%s" % (OWNER, NAME)
+
+WORKSPACE = "/home/cao/workspace"
+# One bare clone per repository, shared by every PR of it, and one detached worktree per
+# PR. A worktree rather than a checkout in a shared clone: two reviews of the same repo
+# must not fight over HEAD, and the repo must not be left on some review's branch.
+BARE = os.path.join(WORKSPACE, ".cao-repos", "%s.git" % SLUG)
+WT = os.path.join(WORKSPACE, ".cao-worktrees", SLUG, "pr-%d" % PR)
+# Every agent step runs here. Named REPO because that is what the prompts call it.
+REPO = WT
+# Outside the checkout, so a review run never dirties the git tree. Keyed by owner as
+# well as name: two repos of the same name from different owners are different repos.
+ART = os.path.join(WORKSPACE, ".cao-review", SLUG, "pr-%d" % PR)
 DIFF = os.path.join(ART, "diff.patch")
 META = os.path.join(ART, "meta.json")
 MERGED = os.path.join(ART, "merged.json")
@@ -107,20 +139,90 @@ def _load_round1(path, source):
     return [_norm(f, source, i + 1) for i, f in enumerate(items) if isinstance(f, dict)]
 
 
-# --- stage 0: fetch the PR -------------------------------------------------------
-# Plain Python, not an agent step: gh is cheap, and skipping when the files already
-# exist keeps this resume-safe.
-if not (os.path.exists(DIFF) and os.path.exists(META)):
+# --- stage 0: check out the PR and fetch its diff ---------------------------------
+# Plain Python, not an agent step. The whole stage is skipped once the diff, the
+# metadata and the worktree are all present. That is what makes resume safe, and it is
+# also what stops a resume from re-pointing the checkout at commits newer than the
+# cached diff describes -- reviewing code that does not match the diff is the failure
+# this stage exists to prevent.
+PR_REF = "refs/cao/pr-%d" % PR
+SLUG_PATH = "%s/%s" % (OWNER, NAME)
+GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+def _git(*args, **kwargs):
+    """Run git and hand back the result. The caller decides whether failure matters."""
+    return subprocess.run(["git"] + list(args), env=GIT_ENV,
+                          capture_output=True, text=True, **kwargs)
+
+
+def _git_ok(*args, **kwargs):
+    done = _git(*args, **kwargs)
+    if done.returncode != 0:
+        raise SystemExit("git %s failed: %s" % (" ".join(args), done.stderr.strip()))
+    return done.stdout
+
+
+def _prune_finished_worktrees():
+    """Drop checkouts of this repo's other PRs whose review already produced a report.
+
+    Disk hygiene only: artifacts, final-review.md included, are never touched -- just
+    the working copy, which is reproducible from the bare clone. Completion is read off
+    the filesystem rather than from a timestamp, because a workflow script that consults
+    the clock diverges on resume.
+    """
+    _git("worktree", "prune", cwd=BARE)
+    root = os.path.join(WORKSPACE, ".cao-worktrees", SLUG)
+    if not os.path.isdir(root):
+        return
+    for entry in sorted(os.listdir(root)):
+        if entry == "pr-%d" % PR or not entry.startswith("pr-"):
+            continue
+        report = os.path.join(WORKSPACE, ".cao-review", SLUG, entry, "final-review.md")
+        if os.path.exists(report):
+            _git("worktree", "remove", "--force", os.path.join(root, entry), cwd=BARE)
+
+
+if not (os.path.exists(DIFF) and os.path.exists(META)
+        and os.path.exists(os.path.join(WT, ".git"))):
+    os.makedirs(os.path.dirname(BARE), exist_ok=True)
+    os.makedirs(os.path.dirname(WT), exist_ok=True)
+    # One lock per repository, held only across the git mutations. Two reviews of
+    # different PRs of the same repo otherwise race on one object store and one set of
+    # worktree admin files, which fails intermittently rather than cleanly.
+    with open(os.path.join(WORKSPACE, ".cao-repos", "%s.lock" % SLUG), "w") as _lock:
+        fcntl.flock(_lock, fcntl.LOCK_EX)
+        if not os.path.isdir(BARE):
+            _git_ok("clone", "--bare", "https://github.com/%s.git" % SLUG_PATH, BARE)
+        # refs/pull/<n>/head resolves for merged and closed PRs and for PRs from forks.
+        # A branch name does none of those, which is how the previous version ended up
+        # reviewing whatever the local clone happened to be sitting on.
+        _git_ok("fetch", "--force", "origin", "pull/%d/head:%s" % (PR, PR_REF), cwd=BARE)
+        _prune_finished_worktrees()
+        if os.path.exists(WT):
+            _git("worktree", "remove", "--force", WT, cwd=BARE)
+        if os.path.exists(WT):
+            # git declined because the path is not a registered worktree -- a leftover
+            # from an interrupted run. The directory is ours alone, so take it out.
+            shutil.rmtree(WT)
+        _git_ok("worktree", "add", "--detach", WT, PR_REF, cwd=BARE)
+
     _meta = subprocess.run(
-        ["gh", "pr", "view", str(PR), "--json", "title,body,url,headRefName,baseRefName,files"],
-        cwd=REPO, capture_output=True, text=True, check=True,
+        ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json",
+         "title,body,url,headRefName,baseRefName,files"],
+        capture_output=True, text=True, check=True,
     ).stdout
     _diff = subprocess.run(
-        ["gh", "pr", "diff", str(PR)],
-        cwd=REPO, capture_output=True, text=True, check=True,
+        ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
+        capture_output=True, text=True, check=True,
     ).stdout
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
+
+# Outside the setup guard: ~/.claude.json is not on a volume, so a container recreate
+# drops the trust record while the worktree on the volume survives. Untrusted, Claude
+# opens a blocking dialog and the step dies on an init timeout. Cheap and idempotent.
+subprocess.run(["cao-trust", WT], check=True)
 
 FINDING_SHAPE = (
     '{"findings": [{"file": "<path relative to the repo root>", "line": <int>, '

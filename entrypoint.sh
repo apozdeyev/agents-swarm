@@ -20,6 +20,15 @@ if [ -n "${GIT_USER_NAME:-}" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then
   git config --global user.email "$GIT_USER_EMAIL"
 fi
 
+# The gh token alone does not authenticate `git`: clone and fetch go through git's own
+# credential helper, which `gh auth setup-git` installs into ~/.gitconfig. That file is
+# not on a volume, so it is lost on every container recreate -- re-apply it here rather
+# than leaving it to a one-off `./cao login-gh`. Guarded, because a container that has
+# not been logged in yet would otherwise abort the whole start under `set -e`.
+if gh auth status >/dev/null 2>&1; then
+  gh auth setup-git
+fi
+
 # WORKFLOW_SPEC_DIR is $CAO_HOME_DIR/workflows, which lives on the state volume.
 # Sync from the image on every start so a rebuild ships new workflow versions.
 mkdir -p "$CAO_HOME_DIR/workflows"
