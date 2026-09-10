@@ -189,8 +189,41 @@ def _prune_finished_worktrees():
             _git("worktree", "remove", "--force", os.path.join(root, entry), cwd=BARE)
 
 
-if not (os.path.exists(DIFF) and os.path.exists(META)
-        and os.path.exists(os.path.join(WT, ".git"))):
+# Which commit this run reviews, and which run pinned it. The run id is the seam
+# between the two things stage 0 has to do at once: a NEW run must notice that the PR
+# gained commits since last time and re-read it, while a RESUME must keep the snapshot
+# it started from -- re-reading there would put new code under findings already made
+# against the old, which is the failure this whole stage exists to prevent. The run id
+# is stable across a resume and different for a new run, so it tells the two apart.
+SNAPSHOT = os.path.join(ART, "snapshot.json")
+RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "")
+
+
+def _head_oid():
+    """The PR's current head, from the API rather than from whatever is on disk."""
+    return subprocess.run(
+        ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json", "headRefOid",
+         "-q", ".headRefOid"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+try:
+    _pinned = json.load(open(SNAPSHOT))
+except (OSError, ValueError):
+    _pinned = {}
+
+_on_disk = (os.path.exists(DIFF) and os.path.exists(META)
+            and os.path.exists(os.path.join(WT, ".git")))
+
+if _on_disk and RUN_ID and _pinned.get("run_id") == RUN_ID:
+    # A resume of the run that took this snapshot. Keep it exactly as it was, and do
+    # not ask the API anything -- the answer could have changed since.
+    HEAD_OID = _pinned.get("head", "")
+else:
+    HEAD_OID = _head_oid()
+
+if not (_on_disk and _pinned.get("head") == HEAD_OID):
     os.makedirs(os.path.dirname(BARE), exist_ok=True)
     os.makedirs(os.path.dirname(WT), exist_ok=True)
     # One lock per repository, held only across the git mutations. Two reviews of
@@ -215,7 +248,7 @@ if not (os.path.exists(DIFF) and os.path.exists(META)
 
     _meta = subprocess.run(
         ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json",
-         "title,body,url,headRefName,baseRefName,files"],
+         "title,body,url,headRefName,headRefOid,baseRefName,files"],
         capture_output=True, text=True, check=True,
     ).stdout
     _diff = subprocess.run(
@@ -224,6 +257,23 @@ if not (os.path.exists(DIFF) and os.path.exists(META)
     ).stdout
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
+
+    # The diff just changed under them, so the previous review's outputs describe code
+    # that is no longer here. Left in place they would be read as this run's -- a harness
+    # that writes nothing would silently contribute the old commit's findings, and the
+    # merge would mix the two. Only reached when something was actually re-read, never
+    # on a resume.
+    for stale in (MERGED, FINAL, os.path.join(ART, "dedup-candidates.json"),
+                  os.path.join(ART, "dedup-merges.json")):
+        if os.path.exists(stale):
+            os.remove(stale)
+    for sub in ("round1", "round2"):
+        for leftover in os.listdir(os.path.join(ART, sub)):
+            os.remove(os.path.join(ART, sub, leftover))
+
+# Written even when nothing was re-read, so that a resume of THIS run recognises its own
+# snapshot and leaves it alone.
+open(SNAPSHOT, "w").write(json.dumps({"run_id": RUN_ID, "head": HEAD_OID}, indent=2))
 
 # Outside the setup guard: ~/.claude.json is not on a volume, so a container recreate
 # drops the trust record while the worktree on the volume survives. Untrusted, Claude
