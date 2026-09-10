@@ -260,12 +260,64 @@ class ApplyMerges(unittest.TestCase):
         self.assertEqual(out[0]["independent_sources"], 2)
         self.assertEqual(out[0]["sources"], ["claude", "codex", "opencode"])
 
+    def test_a_repeated_id_does_not_delete_the_keeper(self):
+        # A model writing ["claude-1", "claude-1", "codex-1"] put the same object in
+        # `members` twice, so the keeper was also members[1] and the loop dropped its
+        # own id. Both findings then left the run without a word.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
+        out = MOD._apply_merges(deduped, [["claude-1", "claude-1", "codex-1"]])
+        self.assertEqual([f["id"] for f in out], ["claude-1"])
+        self.assertEqual(out[0]["sources"], ["claude", "codex"])
+
+    def test_a_repeated_id_cannot_stand_in_for_a_second_member(self):
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
+        out = MOD._apply_merges(deduped, [["claude-1", "claude-1"]])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
+        self.assertFalse(out[0]["merged_semantically"])
+
+    def test_same_source_group_is_refused_even_when_one_is_corroborated(self):
+        # `sources` stops being an author list once _dedup has run: claude-1 carries
+        # codex's name too, which used to satisfy a "two distinct sources" union and let
+        # one reviewer's two findings merge -- the exact case the prompt forbids.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
+                              _finding("claude", 2, line=200)])
+        self.assertEqual(deduped[0]["sources"], ["claude", "codex"])
+        out = MOD._apply_merges(deduped, [["claude-1", "claude-2"]])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
+
     def test_merged_findings_are_json_serialisable(self):
         # merged.json is what the arbiter reads; a field the encoder chokes on would
         # take the run down after round 2.
         deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
         out = MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
         self.assertIn('"merged_semantically": true', json.dumps(out))
+
+
+class JuryTargets(unittest.TestCase):
+    def _merged(self):
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
+        return MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
+
+    def test_a_merged_finding_never_goes_back_to_its_authors(self):
+        # The regression: `sources != [key]` is true for BOTH authors of a two-name
+        # finding, so each was handed its own work to rule on, anonymised, under a
+        # prompt that says "None of them are yours".
+        merged = self._merged()
+        self.assertEqual(MOD._jury_targets(merged, "claude"), [])
+        self.assertEqual(MOD._jury_targets(merged, "codex"), [])
+        self.assertEqual([f["id"] for f in MOD._jury_targets(merged, "opencode")],
+                         ["claude-1"])
+
+    def test_a_solo_finding_goes_to_the_other_two(self):
+        deduped = MOD._dedup([_finding("claude", 1)])
+        self.assertEqual(MOD._jury_targets(deduped, "claude"), [])
+        self.assertEqual(len(MOD._jury_targets(deduped, "codex")), 1)
+        self.assertEqual(len(MOD._jury_targets(deduped, "opencode")), 1)
+
+    def test_a_corroborated_finding_goes_to_nobody(self):
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1)])
+        for key in ("claude", "codex", "opencode"):
+            self.assertEqual(MOD._jury_targets(deduped, key), [])
 
 
 if __name__ == "__main__":

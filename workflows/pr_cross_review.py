@@ -212,8 +212,19 @@ def _apply_merges(deduped, groups):
     for group in groups:
         if not isinstance(group, list):
             continue
-        members = [by_id[i] for i in group if i in by_id and i not in dropped]
-        if len(members) < 2 or len({s for m in members for s in m["sources"]}) < 2:
+        # Unique ids, order kept. A repeated id -- an ordinary model slip, and one the
+        # prompt says nothing against -- put the same object in `members` twice, so the
+        # keeper was also members[1] and the loop dropped its own id: both findings then
+        # vanished from the run, silently, with `len(members) >= 2` satisfied by the
+        # repetition alone.
+        members = [by_id[i] for i in dict.fromkeys(group) if i in by_id and i not in dropped]
+        # Every member must bring authors none of the others has. A union of two was not
+        # that test: `sources` stops being an author list once `_dedup` has run -- a
+        # finding two harnesses filed at the same line carries both names -- so a group
+        # of two Claude findings passed whenever either of them was corroborated, which
+        # is exactly the same-reviewer merge the prompt forbids.
+        authors = [s for m in members for s in m["sources"]]
+        if len(members) < 2 or len(set(authors)) != len(authors):
             continue
         keeper = members[0]
         for extra in members[1:]:
@@ -227,6 +238,18 @@ def _apply_merges(deduped, groups):
         # agreement that earns a finding a pass on the jury.
         keeper["merged_semantically"] = True
     return [f for f in deduped if f["id"] not in dropped]
+
+
+def _jury_targets(deduped, key):
+    """The findings `key` is allowed to judge: contested, and none of them its own.
+
+    `sources != [key]` was not that test. A finding the semantic merge grouped carries
+    two names, so it matched neither author's one-name list and went back to BOTH of
+    them to rule on -- with `JUDGE_FIELDS` stripping the id prefix and `sources`, and
+    the prompt telling each judge "None of them are yours". Only reachable since
+    corroboration was frozen in `_dedup`: a merged finding used to skip round 2 outright.
+    """
+    return [f for f in deduped if not f["corroborated"] and key not in f["sources"]]
 
 
 # Everything above this line is pure: no network, no filesystem, no clock. Everything
@@ -384,20 +407,23 @@ if _provisioned:
         # a moment ago: a push landing between the two puts newer commits here.
         _checked_out = _git_ok("rev-parse", PR_REF, cwd=BARE).strip()
 
+    _diff = subprocess.run(
+        ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    # The metadata is read LAST, and that ordering is the check. `gh pr diff` reads the
+    # live PR, so it can describe a commit newer than the one that was fetched --
+    # reviewing a diff against files it does not match is the failure this whole stage
+    # exists to prevent, and caching the mismatch would hand it to every resume as well.
+    # Asking for the head before the diff only proved the PR had not moved by then and
+    # left the fetch-to-diff window wide open; asking after covers everything up to the
+    # diff, and a push landing later than that shows up as a mismatch and refuses the
+    # run, which is the safe direction to be wrong in.
     _meta = subprocess.run(
         ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json",
          "title,body,url,headRefName,headRefOid,baseRefName,files"],
         capture_output=True, text=True, check=True,
     ).stdout
-    _diff = subprocess.run(
-        ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    # `gh pr diff` reads the live PR, so it can describe a commit newer than the one
-    # that was fetched. Reviewing a diff against files it does not match is the failure
-    # this whole stage exists to prevent, and caching the mismatch would hand it to
-    # every resume as well -- so refuse the run instead. The metadata is queried in the
-    # same window as the diff and carries the head the API had then.
     _meta_head = json.loads(_meta).get("headRefOid", "")
     if _meta_head != _checked_out:
         raise SystemExit(
@@ -647,7 +673,7 @@ def _validate(spec):
     len(HARNESSES) steps instead of len(HARNESSES) * (len(HARNESSES) - 1).
     """
     key, provider, agent = spec
-    targets = [f for f in deduped if not f["corroborated"] and f["sources"] != [key]]
+    targets = _jury_targets(deduped, key)
     if not targets:
         return key, {}, None
     payload, id_map = _anonymize(targets)
