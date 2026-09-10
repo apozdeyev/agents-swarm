@@ -84,9 +84,6 @@ HARNESSES = (
     ("opencode", "opencode_cli", "reviewer_opencode"),
 )
 
-os.makedirs(os.path.join(ART, "round1"), exist_ok=True)
-os.makedirs(os.path.join(ART, "round2"), exist_ok=True)
-
 
 def _read_json(path, default):
     """Parse a file an agent wrote. Tolerates code fences and surrounding prose."""
@@ -106,11 +103,31 @@ def _read_json(path, default):
             return default
 
 
+def _read_list(path, key):
+    """The list under `key` in an agent-written JSON file, or [] for anything else.
+
+    A model asked for {"<key>": [...]} sometimes writes the bare array instead, or the
+    key with a null under it. Both used to reach `.get`/`for` unguarded -- an array is
+    truthy, so `or {}` never fired -- and the AttributeError escaped the pool and
+    killed a run that had already paid for round 1. Round 1 checks the shape of what
+    it reads (`_load_round1`); this is the same check for everything else.
+    """
+    data = _read_json(path, None)
+    items = data.get(key) if isinstance(data, dict) else data
+    return items if isinstance(items, list) else []
+
+
 def _norm(finding, source, index):
     """Coerce one agent-authored finding into the shape the rest of the script assumes."""
     path = str(finding.get("file") or "").strip()
     if os.path.isabs(path):
         path = os.path.relpath(path, REPO)
+    # A prefix, not a character set: str.lstrip("./") turned ".dockerignore" into
+    # "dockerignore" and ".github/workflows/ci.yml" into "github/workflows/ci.yml".
+    # That corrupted path is what the round-2 judge is handed and what the arbiter
+    # cites, so a real defect in a dotfile came back needs-context every time.
+    if path.startswith("./"):
+        path = path[2:]
     try:
         line = int(finding.get("line"))
     except (TypeError, ValueError):
@@ -120,7 +137,7 @@ def _norm(finding, source, index):
     return {
         "id": "%s-%d" % (source, index),
         "sources": [source],
-        "file": path.lstrip("./"),
+        "file": path,
         "line": line,
         "severity": severity if severity in SEVERITIES else "medium",
         "category": category if category in CATEGORIES else "correctness",
@@ -145,6 +162,81 @@ def _load_round1(path, source):
     return [_norm(f, source, i + 1) for i, f in enumerate(items) if isinstance(f, dict)]
 
 
+def _dedup(findings):
+    """Collapse the findings two harnesses filed at the same place into one.
+
+    Same file, same category, same line. Proximity used to count as well -- lines
+    within three of each other -- which merged a missing bounds check at :100 with a
+    wrong return value at :102, discarded the loser's text outright and then marked the
+    survivor corroborated: two reviewers who found two different bugs produced one
+    auto-confirmed claim. Near misses go to the semantic pass instead, which reads the
+    descriptions rather than guessing from a line number.
+    """
+    deduped = []
+    for finding in findings:
+        for kept in deduped:
+            same_place = (
+                kept["file"] == finding["file"]
+                and kept["category"] == finding["category"]
+                and kept["line"] is not None
+                and kept["line"] == finding["line"]
+            )
+            if same_place:
+                for src in finding["sources"]:
+                    if src not in kept["sources"]:
+                        kept["sources"].append(src)
+                kept["merged_ids"] = kept.get("merged_ids", []) + [finding["id"]]
+                break
+        else:
+            deduped.append(finding)
+    for finding in deduped:
+        # Frozen here, before the semantic pass can union more names into `sources`:
+        # this is the flag that skips round 2, and only agreement the harnesses reached
+        # on their own -- same defect, same line, no model in between -- may do that.
+        finding["independent_sources"] = len(finding["sources"])
+        finding["corroborated"] = finding["independent_sources"] > 1
+        finding["merged_semantically"] = False
+    return deduped
+
+
+def _apply_merges(deduped, groups):
+    """Fold each group of ids into its first member, and return what survives.
+
+    A group has to span two distinct sources. The merge prompt already forbids grouping
+    two findings from one reviewer, but nothing checked, and a group that slipped
+    through dropped its other members outright -- title, detail and failure scenario
+    gone from the run, only the id left behind in `merged_ids`.
+    """
+    by_id = {f["id"]: f for f in deduped}
+    dropped = set()
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        members = [by_id[i] for i in group if i in by_id and i not in dropped]
+        if len(members) < 2 or len({s for m in members for s in m["sources"]}) < 2:
+            continue
+        keeper = members[0]
+        for extra in members[1:]:
+            for src in extra["sources"]:
+                if src not in keeper["sources"]:
+                    keeper["sources"].append(src)
+            keeper["merged_ids"] = keeper.get("merged_ids", []) + [extra["id"]]
+            dropped.add(extra["id"])
+        # Deliberately not `corroborated`: one model decided these describe the same
+        # defect. That is a claim for the arbiter to weigh, not the independent
+        # agreement that earns a finding a pass on the jury.
+        keeper["merged_semantically"] = True
+    return [f for f in deduped if f["id"] not in dropped]
+
+
+# Everything above this line is pure: no network, no filesystem, no clock. Everything
+# below clones a repository and drives three model harnesses. CAO runs this file as a
+# script (`python pr_cross_review.py`, its own process), so the guard fires only for
+# tests/test_pr_cross_review.py, which loads the module for the helpers above and
+# catches the exit.
+if __name__ != "__main__":
+    raise SystemExit(0)
+
 # --- stage 0: check out the PR and fetch its diff ---------------------------------
 # Plain Python, not an agent step. The whole stage is skipped once the diff, the
 # metadata and the worktree are all present. That is what makes resume safe, and it is
@@ -154,6 +246,10 @@ def _load_round1(path, source):
 PR_REF = "refs/cao/pr-%d" % PR
 SLUG_PATH = "%s/%s" % (OWNER, NAME)
 GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+LOCKS = os.path.join(WORKSPACE, ".cao-repos")
+
+os.makedirs(os.path.join(ART, "round1"), exist_ok=True)
+os.makedirs(os.path.join(ART, "round2"), exist_ok=True)
 
 
 def _git(*args, **kwargs):
@@ -167,6 +263,32 @@ def _git_ok(*args, **kwargs):
     if done.returncode != 0:
         raise SystemExit("git %s failed: %s" % (" ".join(args), done.stderr.strip()))
     return done.stdout
+
+
+def _pr_lock(directory):
+    """Take the lock on one PR's checkout, or return None when a run already holds it."""
+    os.makedirs(LOCKS, exist_ok=True)
+    handle = open(os.path.join(LOCKS, "%s.%s.lock" % (SLUG, directory)), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+# One lock per PR, taken before anything is touched and held for the whole run -- the
+# per-repository lock below covers only the git mutations. Every path this run writes
+# is keyed by PR alone (the worktree, diff.patch, round1/, round2/, merged.json), so a
+# second review of the same PR would overwrite the first's material while it is still
+# being read, and could remove and recreate its checkout underneath live agents. It is
+# also what tells `_prune_finished_worktrees` which sibling checkouts are live: the
+# lock dies with the process holding it, so a run that crashed leaves nothing to clean
+# up by hand. Module-level, so the descriptor outlives this line -- closing it, or
+# letting it be collected, releases the lock.
+RUN_LOCK = _pr_lock("pr-%d" % PR)
+if RUN_LOCK is None:
+    raise SystemExit("a review of %s#%d is already running" % (SLUG_PATH, PR))
 
 
 def _prune_finished_worktrees():
@@ -185,8 +307,18 @@ def _prune_finished_worktrees():
         if entry == "pr-%d" % PR or not entry.startswith("pr-"):
             continue
         report = os.path.join(WORKSPACE, ".cao-review", SLUG, entry, "final-review.md")
-        if os.path.exists(report):
-            _git("worktree", "remove", "--force", os.path.join(root, entry), cwd=BARE)
+        if not os.path.exists(report):
+            continue
+        # A report is not proof that the review is over. A re-review of that PR finds
+        # its diff and its worktree already on disk and skips this stage entirely, so
+        # last time's final-review.md sits there for the whole run while three agents
+        # work in the checkout -- and `worktree remove --force` would pull it out from
+        # under them. The lock is the live signal; when it is held, leave the checkout.
+        held = _pr_lock(entry)
+        if held is None:
+            continue
+        _git("worktree", "remove", "--force", os.path.join(root, entry), cwd=BARE)
+        held.close()
 
 
 # Which commit this run reviews, and which run pinned it. The run id is the seam
@@ -216,14 +348,17 @@ except (OSError, ValueError):
 _on_disk = (os.path.exists(DIFF) and os.path.exists(META)
             and os.path.exists(os.path.join(WT, ".git")))
 
-if _on_disk and RUN_ID and _pinned.get("run_id") == RUN_ID:
+_is_resume = bool(RUN_ID) and _on_disk and _pinned.get("run_id") == RUN_ID
+
+if _is_resume:
     # A resume of the run that took this snapshot. Keep it exactly as it was, and do
     # not ask the API anything -- the answer could have changed since.
     HEAD_OID = _pinned.get("head", "")
 else:
     HEAD_OID = _head_oid()
 
-if not (_on_disk and _pinned.get("head") == HEAD_OID):
+_provisioned = not (_on_disk and _pinned.get("head") == HEAD_OID)
+if _provisioned:
     os.makedirs(os.path.dirname(BARE), exist_ok=True)
     os.makedirs(os.path.dirname(WT), exist_ok=True)
     # One lock per repository, held only across the git mutations. Two reviews of
@@ -245,6 +380,9 @@ if not (_on_disk and _pinned.get("head") == HEAD_OID):
             # from an interrupted run. The directory is ours alone, so take it out.
             shutil.rmtree(WT)
         _git_ok("worktree", "add", "--detach", WT, PR_REF, cwd=BARE)
+        # What is actually in the checkout, which is not necessarily what the API named
+        # a moment ago: a push landing between the two puts newer commits here.
+        _checked_out = _git_ok("rev-parse", PR_REF, cwd=BARE).strip()
 
     _meta = subprocess.run(
         ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json",
@@ -255,14 +393,30 @@ if not (_on_disk and _pinned.get("head") == HEAD_OID):
         ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
         capture_output=True, text=True, check=True,
     ).stdout
+    # `gh pr diff` reads the live PR, so it can describe a commit newer than the one
+    # that was fetched. Reviewing a diff against files it does not match is the failure
+    # this whole stage exists to prevent, and caching the mismatch would hand it to
+    # every resume as well -- so refuse the run instead. The metadata is queried in the
+    # same window as the diff and carries the head the API had then.
+    _meta_head = json.loads(_meta).get("headRefOid", "")
+    if _meta_head != _checked_out:
+        raise SystemExit(
+            "PR #%d moved while it was being set up: the worktree is at %s, the diff "
+            "describes %s. Re-run -- the new head is picked up then."
+            % (PR, _checked_out[:12], _meta_head[:12]))
+    HEAD_OID = _checked_out
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
 
-    # The diff just changed under them, so the previous review's outputs describe code
-    # that is no longer here. Left in place they would be read as this run's -- a harness
-    # that writes nothing would silently contribute the old commit's findings, and the
-    # merge would mix the two. Only reached when something was actually re-read, never
-    # on a resume.
+# Artifacts of a previous run are not this run's. `_review` and `_validate` read their
+# results off the disk precisely because a step can come back `completed` having
+# written nothing -- and a file left by the last review of this PR satisfies that check
+# just as well, so the very failure this pipeline exists to expose would be recorded as
+# a successful review reporting the old run's findings, with the stale verdicts mapped
+# onto whatever positional id they now collide with. Cleared whenever the checkout was
+# re-read, and equally when a distinct run starts against a head that has not moved.
+# Never on a resume: its steps are already recorded completed and will not write again.
+if _provisioned or (RUN_ID and not _is_resume):
     for stale in (MERGED, FINAL, os.path.join(ART, "dedup-candidates.json"),
                   os.path.join(ART, "dedup-merges.json")):
         if os.path.exists(stale):
@@ -374,30 +528,12 @@ if len(failures) == len(HARNESSES):
     raise SystemExit(1)
 
 # --- stage 1: normalize and dedup ------------------------------------------------
-# Python first: same file, same category, lines within 3 is the same finding.
-pool_findings = [f for key in sorted(round1) for f in round1[key]]
-deduped = []
-for finding in pool_findings:
-    for kept in deduped:
-        same_place = (
-            kept["file"] == finding["file"]
-            and kept["category"] == finding["category"]
-            and kept["line"] is not None
-            and finding["line"] is not None
-            and abs(kept["line"] - finding["line"]) <= 3
-        )
-        if same_place:
-            for src in finding["sources"]:
-                if src not in kept["sources"]:
-                    kept["sources"].append(src)
-            kept["merged_ids"] = kept.get("merged_ids", []) + [finding["id"]]
-            break
-    else:
-        deduped.append(finding)
+# Python first: same file, same category, same line is the same finding.
+deduped = _dedup([f for key in sorted(round1) for f in round1[key]])
 
-# Then an agent pass for the semantic duplicates Python cannot see: the same bug
-# described in different words, at different lines, or filed under a different category.
-if len([f for f in deduped if len(f["sources"]) == 1]) > 1:
+# Then an agent pass for the duplicates Python cannot see: the same bug described in
+# different words, at a nearby line, or filed under a different category.
+if len([f for f in deduped if not f["corroborated"]]) > 1:
     candidates = os.path.join(ART, "dedup-candidates.json")
     merges_out = os.path.join(ART, "dedup-merges.json")
     open(candidates, "w").write(json.dumps(
@@ -417,20 +553,7 @@ if len([f for f in deduped if len(f["sources"]) == 1]) > 1:
         step("claude_code", "reviewer", merge_prompt,
              recovery="idempotent", step_id="merge-semantic", timeout=TIMEOUT,
              working_directory=REPO, allowed_tools=WRITE_TOOLS)
-        by_id = {f["id"]: f for f in deduped}
-        dropped = set()
-        for group in (_read_json(merges_out, {}) or {}).get("merges", []):
-            members = [by_id[i] for i in group if i in by_id and i not in dropped]
-            if len(members) < 2:
-                continue
-            keeper = members[0]
-            for extra in members[1:]:
-                for src in extra["sources"]:
-                    if src not in keeper["sources"]:
-                        keeper["sources"].append(src)
-                keeper["merged_ids"] = keeper.get("merged_ids", []) + [extra["id"]]
-                dropped.add(extra["id"])
-        deduped = [f for f in deduped if f["id"] not in dropped]
+        deduped = _apply_merges(deduped, _read_list(merges_out, "merges"))
     except ShimHTTPError as exc:
         if getattr(exc, "status", None) == 409:
             raise
@@ -438,21 +561,33 @@ if len([f for f in deduped if len(f["sources"]) == 1]) > 1:
     except ShimError as exc:
         failures["merge-semantic"] = str(exc)
 
+# `corroborated` was set in `_dedup`, off round 1 alone: found independently by two or
+# more harnesses IS the cross-confirmation round 2 exists to produce, so such a finding
+# is confirmed there and skips validation. Two of three agreeing is stronger evidence
+# than two of two was -- the finding had a real chance to go uncorroborated and did not.
+# The semantic merge above unions `sources` too, and that is a different thing: one
+# model's opinion that two write-ups are the same defect. It sets `merged_semantically`
+# and nothing skips the jury on it.
 for f in deduped:
     f["sources"] = sorted(f["sources"])
-    # Found independently by two or more harnesses: that IS the cross-confirmation round 2
-    # exists to produce, so it is confirmed here and skips validation. Two of three
-    # agreeing is stronger evidence than two of two was -- the finding had a real chance
-    # to go uncorroborated and did not.
-    f["corroborated"] = len(f["sources"]) > 1
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
 
 if not deduped:
-    open(FINAL, "w").write(
-        "# PR #%d cross-review\n\nNo findings. Claude, Codex and OpenCode each reviewed "
-        "the diff and none reported a defect.\n" % PR)
+    # Which harnesses actually delivered, rather than the flat claim that all three
+    # did: `failures` used to reach emit_output's JSON only, so on this one path -- the
+    # only one that writes a report without an arbiter -- two harnesses could come back
+    # `completed` having written nothing and the PR still got a clean bill of health
+    # from all three, exit code 0. That is the conflation the rest of this fixes.
+    _delivered = sorted(key for key, _, err in _r1 if not err)
+    _report = ["# PR #%d cross-review\n" % PR,
+               "\nNo findings: %s reviewed the diff and reported no defect.\n"
+               % ", ".join(_delivered)]
+    if failures:
+        _report.append("\n**Did not deliver:**\n\n")
+        _report.extend("- `%s` - %s\n" % (name, err) for name, err in sorted(failures.items()))
+    open(FINAL, "w").write("".join(_report))
     emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures})
-    raise SystemExit(0)
+    raise SystemExit(1 if failures else 0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
 R2_PROMPT = (
@@ -534,7 +669,7 @@ def _validate(spec):
         return key, {}, str(exc)
     except ShimError as exc:
         return key, {}, str(exc)
-    verdicts = (_read_json(outfile, {}) or {}).get("verdicts", [])
+    verdicts = _read_list(outfile, "verdicts")
     ruled = {}
     for verdict in verdicts:
         if not isinstance(verdict, dict):
@@ -574,8 +709,11 @@ for finding in deduped:
     if finding["corroborated"]:
         finding["verdicts"]["corroboration"] = {
             "verdict": "confirmed",
+            # `independent_sources`, not len(sources): the semantic merge adds names to
+            # that list, and a claim it grouped is not something the harnesses reported
+            # independently. Saying so would manufacture the corroboration.
             "reasoning": "Reported independently by %d of %d harnesses in round 1." % (
-                len(finding["sources"]), len(HARNESSES)),
+                finding["independent_sources"], len(HARNESSES)),
             "corrected_severity": finding["severity"],
         }
     # With two judges per contested finding the jury can disagree, and that disagreement
@@ -594,8 +732,11 @@ open(MERGED, "w").write(json.dumps(deduped, indent=2))
 ARBITER_PROMPT = (
     "Write the final review for pull request #%d of the repository at %s.\n\n"
     "The adjudicated findings are in the JSON array at %s. Each has `sources` (which "
-    "harnesses reported it), `corroborated` (true when two or more did, independently), "
-    "`verdicts` keyed by judging harness, and `ruling` summarising them. Three harnesses "
+    "harnesses reported it), `corroborated` (true when two or more reported it "
+    "independently, at the same line, in round 1), `merged_semantically` (true when a "
+    "merge step judged separate write-ups to be one defect -- one model's opinion, not "
+    "independent agreement), `verdicts` keyed by judging harness, and `ruling` "
+    "summarising them. Three harnesses "
     "ran: Claude, Codex and OpenCode/DeepSeek. The diff is at %s and PR metadata at %s.\n\n"
     "Resolve the material: drop rejected findings unless the rejection is plainly wrong "
     "(say so if you overrule one), rank what survives by real severity rather than by the "
@@ -622,6 +763,14 @@ except ShimHTTPError as exc:
 except ShimError as exc:
     failures["arbiter"] = str(exc)
 
+# Both rounds verify their artifact on disk; the report is this workflow's one
+# deliverable and had no such check. A step that replied in the terminal without
+# writing the file was reported as a success pointing at a path that does not exist.
+# The floor is a size, not existence alone: a truncated file is the same non-delivery.
+_report_bytes = os.path.getsize(FINAL) if os.path.exists(FINAL) else 0
+if "arbiter" not in failures and _report_bytes < 200:
+    failures["arbiter"] = "no usable report at %s (%d bytes)" % (FINAL, _report_bytes)
+
 emit_output({
     "pr": PR,
     "final_review": FINAL,
@@ -633,3 +782,8 @@ emit_output({
     "split": len([f for f in deduped if f["ruling"] == "split"]),
     "failures": failures,
 })
+
+if "arbiter" in failures:
+    # Nothing to hand back: exit non-zero so the run is recorded FAILED rather than
+    # completed with a `final_review` path nobody can open.
+    raise SystemExit(1)
