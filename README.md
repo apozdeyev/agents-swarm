@@ -13,6 +13,10 @@ container and its volumes: no host bind mounts, no docker socket, non-root.
 
 ## Quick start
 
+Needs Docker Compose **2.24 or newer** — the `env_file` mapping form that lets the
+stack start without a `.env` arrived in that release, and an older Compose rejects the
+file outright rather than saying so.
+
 ```sh
 ./cao up            # build + start; web UI on http://localhost:9889
 

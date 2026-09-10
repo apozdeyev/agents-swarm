@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from cao_workflow import ShimError, ShimHTTPError, emit_output, get_inputs, step
@@ -103,18 +104,22 @@ def _read_json(path, default):
             return default
 
 
-def _read_list(path, key):
-    """The list under `key` in an agent-written JSON file, or [] for anything else.
+def _read_items(path, key):
+    """The list under `key` in an agent-written JSON file, or None when there is none.
 
     A model asked for {"<key>": [...]} sometimes writes the bare array instead, or the
     key with a null under it. Both used to reach `.get`/`for` unguarded -- an array is
-    truthy, so `or {}` never fired -- and the AttributeError escaped the pool and
-    killed a run that had already paid for round 1. Round 1 checks the shape of what
-    it reads (`_load_round1`); this is the same check for everything else.
+    truthy, so `or {}` never fired -- and the AttributeError escaped the pool and killed
+    a run that had already paid for round 1.
+
+    None rather than []: an empty list is an answer a step is invited to give, and
+    "wrote nothing" is a failure. Round 1 has always drawn that line; flattening both to
+    [] is what let the merge step return `completed` having written nothing and have it
+    pass for "no duplicates found".
     """
     data = _read_json(path, None)
     items = data.get(key) if isinstance(data, dict) else data
-    return items if isinstance(items, list) else []
+    return items if isinstance(items, list) else None
 
 
 def _norm(finding, source, index):
@@ -155,9 +160,8 @@ def _load_round1(path, source):
     is a useful result the prompt explicitly invites; "the step ended without writing
     anything" is a failure that used to be recorded as the former.
     """
-    data = _read_json(path, None)
-    items = data.get("findings") if isinstance(data, dict) else data
-    if not isinstance(items, list):
+    items = _read_items(path, "findings")
+    if items is None:
         return None
     return [_norm(f, source, i + 1) for i, f in enumerate(items) if isinstance(f, dict)]
 
@@ -252,6 +256,92 @@ def _jury_targets(deduped, key):
     return [f for f in deduped if not f["corroborated"] and key not in f["sources"]]
 
 
+def _take_lock(path):
+    """Take an exclusive lock on `path`, or return None when someone else holds it.
+
+    The handle IS the lock: it has to outlive the caller's frame, because closing it --
+    or letting it be collected -- releases it. That is also the point. A lock dies with
+    the process holding it, so a run that crashed leaves nothing to be cleaned up by
+    hand, and a stale file never reads as a live run.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _is_resume_of(run_id, pinned, on_disk):
+    """Whether this execution is a resume of the run that left the snapshot on disk.
+
+    All three have to hold. A resume re-executes this file in a new process under the
+    SAME run id, so the id is the seam between the two things stage 0 must do at once:
+    a new run has to notice the PR gained commits and re-read it, a resume has to keep
+    the snapshot it started from. An absent run id -- the script run by hand -- is never
+    a resume: guessing wrong in that direction deletes a run's own output.
+    """
+    return bool(run_id) and on_disk and pinned.get("run_id") == run_id
+
+
+def _artifacts_are_stale(run_id, is_resume, provisioned):
+    """Whether round1/ and round2/ hold a PREVIOUS run's results rather than this one's.
+
+    `_review` and `_validate` read their results off the disk because a step can come
+    back `completed` having written nothing -- and a file the last review of this PR
+    left behind satisfies that check just as well, so the failure this pipeline exists
+    to expose is recorded as a successful review of stale findings. True when the
+    checkout was re-read, and equally when a distinct run starts against a head that has
+    not moved. Never on a resume: its steps are already recorded completed and will not
+    write again, so clearing there throws away the run's own paid-for output.
+    """
+    return bool(provisioned or (run_id and not is_resume))
+
+
+def _clear_artifacts(art, files):
+    """Delete a previous run's outputs: the named files, and both round directories."""
+    for path in files:
+        if os.path.exists(path):
+            os.remove(path)
+    for sub in ("round1", "round2"):
+        directory = os.path.join(art, sub)
+        if os.path.isdir(directory):
+            for leftover in sorted(os.listdir(directory)):
+                os.remove(os.path.join(directory, leftover))
+
+
+def _empty_report(pr, delivered, failures):
+    """The report for a run that found nothing.
+
+    Names the harnesses that actually delivered and lists the ones that did not. The
+    fixed sentence it replaced claimed all three had reviewed the diff whatever
+    happened, and `failures` reached the JSON output alone -- so on the one path that
+    writes a report without an arbiter, two silent harnesses still produced a clean bill
+    of health from three.
+    """
+    text = ["# PR #%d cross-review\n" % pr,
+            "\nNo findings: %s reviewed the diff and reported no defect.\n"
+            % ", ".join(delivered)]
+    if failures:
+        text.append("\n**Did not deliver:**\n\n")
+        text.extend("- `%s` - %s\n" % (name, err) for name, err in sorted(failures.items()))
+    return "".join(text)
+
+
+def _report_is_usable(path):
+    """Whether the arbiter left a report behind at all.
+
+    Both rounds verify their artifact on disk; this is that check for the one deliverable
+    the run exists to produce, which had none -- a step that replied in the terminal
+    without writing the file was reported as a success pointing at a path that does not
+    exist. A size floor rather than existence alone, because a truncated file is the
+    same non-delivery.
+    """
+    return os.path.exists(path) and os.path.getsize(path) >= 200
+
+
 # Everything above this line is pure: no network, no filesystem, no clock. Everything
 # below clones a repository and drives three model harnesses. CAO runs this file as a
 # script (`python pr_cross_review.py`, its own process), so the guard fires only for
@@ -289,15 +379,8 @@ def _git_ok(*args, **kwargs):
 
 
 def _pr_lock(directory):
-    """Take the lock on one PR's checkout, or return None when a run already holds it."""
-    os.makedirs(LOCKS, exist_ok=True)
-    handle = open(os.path.join(LOCKS, "%s.%s.lock" % (SLUG, directory)), "w")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        return None
-    return handle
+    """The lock guarding one PR's checkout, taken. One place builds that path."""
+    return _take_lock(os.path.join(LOCKS, "%s.%s.lock" % (SLUG, directory)))
 
 
 # One lock per PR, taken before anything is touched and held for the whole run -- the
@@ -371,7 +454,7 @@ except (OSError, ValueError):
 _on_disk = (os.path.exists(DIFF) and os.path.exists(META)
             and os.path.exists(os.path.join(WT, ".git")))
 
-_is_resume = bool(RUN_ID) and _on_disk and _pinned.get("run_id") == RUN_ID
+_is_resume = _is_resume_of(RUN_ID, _pinned, _on_disk)
 
 if _is_resume:
     # A resume of the run that took this snapshot. Keep it exactly as it was, and do
@@ -434,22 +517,9 @@ if _provisioned:
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
 
-# Artifacts of a previous run are not this run's. `_review` and `_validate` read their
-# results off the disk precisely because a step can come back `completed` having
-# written nothing -- and a file left by the last review of this PR satisfies that check
-# just as well, so the very failure this pipeline exists to expose would be recorded as
-# a successful review reporting the old run's findings, with the stale verdicts mapped
-# onto whatever positional id they now collide with. Cleared whenever the checkout was
-# re-read, and equally when a distinct run starts against a head that has not moved.
-# Never on a resume: its steps are already recorded completed and will not write again.
-if _provisioned or (RUN_ID and not _is_resume):
-    for stale in (MERGED, FINAL, os.path.join(ART, "dedup-candidates.json"),
-                  os.path.join(ART, "dedup-merges.json")):
-        if os.path.exists(stale):
-            os.remove(stale)
-    for sub in ("round1", "round2"):
-        for leftover in os.listdir(os.path.join(ART, sub)):
-            os.remove(os.path.join(ART, sub, leftover))
+if _artifacts_are_stale(RUN_ID, _is_resume, _provisioned):
+    _clear_artifacts(ART, (MERGED, FINAL, os.path.join(ART, "dedup-candidates.json"),
+                           os.path.join(ART, "dedup-merges.json")))
 
 # Written even when nothing was re-read, so that a resume of THIS run recognises its own
 # snapshot and leaves it alone.
@@ -553,6 +623,21 @@ if len(failures) == len(HARNESSES):
     emit_output({"pr": PR, "error": "every harness failed in round 1", "failures": failures})
     raise SystemExit(1)
 
+
+def _finish(code):
+    """Exit, and when the run failed say where the report it did produce is.
+
+    A non-zero exit makes CAO drop the sentinel `emit_output` just wrote -- the run is
+    recorded FAILED and its output goes with it -- so the one thing a reader still needs
+    goes to stderr, which is what the run record keeps in its place. Only when the file
+    is really there: the arbiter failing to write it is one of the ways to get here, and
+    naming a path that does not exist is worse than saying nothing.
+    """
+    if code and os.path.exists(FINAL):
+        sys.stderr.write("final review: %s\n" % FINAL)
+    raise SystemExit(code)
+
+
 # --- stage 1: normalize and dedup ------------------------------------------------
 # Python first: same file, same category, same line is the same finding.
 deduped = _dedup([f for key in sorted(round1) for f in round1[key]])
@@ -579,7 +664,16 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
         step("claude_code", "reviewer", merge_prompt,
              recovery="idempotent", step_id="merge-semantic", timeout=TIMEOUT,
              working_directory=REPO, allowed_tools=WRITE_TOOLS)
-        deduped = _apply_merges(deduped, _read_list(merges_out, "merges"))
+        # The one stage that was not verified on disk. Every other agent step checks
+        # its artifact because a step can return `completed` having written nothing --
+        # and here that came back indistinguishable from an honest {"merges": []}, so
+        # the dedup silently did nothing, near-duplicates went separately through round
+        # 2 and into the report, and the arbiter was never told.
+        _groups = _read_items(merges_out, "merges")
+        if _groups is None:
+            failures["merge-semantic"] = "no usable merge file at %s" % merges_out
+        else:
+            deduped = _apply_merges(deduped, _groups)
     except ShimHTTPError as exc:
         if getattr(exc, "status", None) == 409:
             raise
@@ -599,21 +693,12 @@ for f in deduped:
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
 
 if not deduped:
-    # Which harnesses actually delivered, rather than the flat claim that all three
-    # did: `failures` used to reach emit_output's JSON only, so on this one path -- the
-    # only one that writes a report without an arbiter -- two harnesses could come back
-    # `completed` having written nothing and the PR still got a clean bill of health
-    # from all three, exit code 0. That is the conflation the rest of this fixes.
+    # The one path that writes a report with no arbiter behind it; `_empty_report` says
+    # who actually delivered, and the exit code says whether anyone did not.
     _delivered = sorted(key for key, _, err in _r1 if not err)
-    _report = ["# PR #%d cross-review\n" % PR,
-               "\nNo findings: %s reviewed the diff and reported no defect.\n"
-               % ", ".join(_delivered)]
-    if failures:
-        _report.append("\n**Did not deliver:**\n\n")
-        _report.extend("- `%s` - %s\n" % (name, err) for name, err in sorted(failures.items()))
-    open(FINAL, "w").write("".join(_report))
+    open(FINAL, "w").write(_empty_report(PR, _delivered, failures))
     emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures})
-    raise SystemExit(1 if failures else 0)
+    _finish(1 if failures else 0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
 R2_PROMPT = (
@@ -695,7 +780,7 @@ def _validate(spec):
         return key, {}, str(exc)
     except ShimError as exc:
         return key, {}, str(exc)
-    verdicts = _read_list(outfile, "verdicts")
+    verdicts = _read_items(outfile, "verdicts") or []
     ruled = {}
     for verdict in verdicts:
         if not isinstance(verdict, dict):
@@ -789,13 +874,9 @@ except ShimHTTPError as exc:
 except ShimError as exc:
     failures["arbiter"] = str(exc)
 
-# Both rounds verify their artifact on disk; the report is this workflow's one
-# deliverable and had no such check. A step that replied in the terminal without
-# writing the file was reported as a success pointing at a path that does not exist.
-# The floor is a size, not existence alone: a truncated file is the same non-delivery.
-_report_bytes = os.path.getsize(FINAL) if os.path.exists(FINAL) else 0
-if "arbiter" not in failures and _report_bytes < 200:
-    failures["arbiter"] = "no usable report at %s (%d bytes)" % (FINAL, _report_bytes)
+if "arbiter" not in failures and not _report_is_usable(FINAL):
+    failures["arbiter"] = "no usable report at %s (%d bytes)" % (
+        FINAL, os.path.getsize(FINAL) if os.path.exists(FINAL) else 0)
 
 emit_output({
     "pr": PR,
@@ -809,7 +890,10 @@ emit_output({
     "failures": failures,
 })
 
-if "arbiter" in failures:
-    # Nothing to hand back: exit non-zero so the run is recorded FAILED rather than
-    # completed with a `final_review` path nobody can open.
-    raise SystemExit(1)
+# Any failure, not just the arbiter's. The two report paths used to disagree on this:
+# the no-findings one exited non-zero whenever a harness had gone missing, while this
+# one returned success as long as the arbiter wrote something -- so identical
+# non-delivery in round 1 or round 2 was recorded FAILED or completed depending only on
+# whether anybody happened to report a finding. The report is still written and still
+# named on the way out; what the exit code says is whether the run happened as designed.
+_finish(1 if failures else 0)

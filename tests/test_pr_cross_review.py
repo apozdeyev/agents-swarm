@@ -156,17 +156,20 @@ class ReadJson(unittest.TestCase):
         # The crash this guards: an array is truthy, so `(x or {}).get(...)` reached
         # list.get and the AttributeError killed the run after round 1 had been paid for.
         path = self._write('[{"id": "f-01", "verdict": "confirmed"}]')
-        self.assertEqual(MOD._read_list(path, "verdicts"),
+        self.assertEqual(MOD._read_items(path, "verdicts"),
                          [{"id": "f-01", "verdict": "confirmed"}])
 
-    def test_null_under_the_key_is_an_empty_list(self):
-        self.assertEqual(MOD._read_list(self._write('{"verdicts": null}'), "verdicts"), [])
+    def test_an_empty_list_is_an_answer_and_nothing_written_is_not(self):
+        # The merge step's non-delivery hid here: {"merges": []} means "no duplicates",
+        # a missing file means the step wrote nothing, and both used to come back [].
+        self.assertEqual(MOD._read_items(self._write('{"merges": []}'), "merges"), [])
+        self.assertIsNone(MOD._read_items(os.path.join(self.dir, "nope.json"), "merges"))
 
-    def test_object_under_the_key_is_an_empty_list(self):
-        self.assertEqual(MOD._read_list(self._write('{"merges": {"a": 1}}'), "merges"), [])
+    def test_null_under_the_key_is_nothing(self):
+        self.assertIsNone(MOD._read_items(self._write('{"verdicts": null}'), "verdicts"))
 
-    def test_missing_file_is_an_empty_list(self):
-        self.assertEqual(MOD._read_list(os.path.join(self.dir, "nope.json"), "merges"), [])
+    def test_object_under_the_key_is_nothing(self):
+        self.assertIsNone(MOD._read_items(self._write('{"merges": {"a": 1}}'), "merges"))
 
 
 class LoadRound1(unittest.TestCase):
@@ -291,6 +294,77 @@ class ApplyMerges(unittest.TestCase):
         deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
         out = MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
         self.assertIn('"merged_semantically": true', json.dumps(out))
+
+
+class StageZero(unittest.TestCase):
+    """The half that destroys state rather than raising when it is wrong."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_a_lock_is_held_until_it_is_released(self):
+        path = os.path.join(self.dir, "locks", "owner__name.pr-1.lock")
+        first = MOD._take_lock(path)
+        self.assertIsNotNone(first)
+        self.assertIsNone(MOD._take_lock(path))
+        first.close()
+        second = MOD._take_lock(path)
+        self.assertIsNotNone(second)
+        second.close()
+
+    def test_a_resume_is_the_same_run_id_over_material_on_disk(self):
+        pinned = {"run_id": "run-1", "head": "abc"}
+        self.assertTrue(MOD._is_resume_of("run-1", pinned, True))
+        self.assertFalse(MOD._is_resume_of("run-2", pinned, True))
+        self.assertFalse(MOD._is_resume_of("run-1", pinned, False))
+        # No run id at all: the script run by hand, never a resume.
+        self.assertFalse(MOD._is_resume_of("", pinned, True))
+        self.assertFalse(MOD._is_resume_of("run-1", {}, True))
+
+    def test_only_a_resume_keeps_the_files_on_disk(self):
+        # Inverting this predicate deletes the output of the run being resumed, whose
+        # steps are recorded completed and will never write again.
+        self.assertFalse(MOD._artifacts_are_stale("run-1", True, False))
+        self.assertTrue(MOD._artifacts_are_stale("run-1", False, False))
+        self.assertTrue(MOD._artifacts_are_stale("run-1", False, True))
+        # Re-provisioned: the diff changed, so nothing on disk describes this code.
+        self.assertTrue(MOD._artifacts_are_stale("", False, True))
+        # Run by hand with no run id and nothing re-read: leave it alone.
+        self.assertFalse(MOD._artifacts_are_stale("", False, False))
+
+    def test_clearing_takes_the_rounds_and_leaves_stage_zero_alone(self):
+        art = self.dir
+        for sub in ("round1", "round2"):
+            os.makedirs(os.path.join(art, sub))
+            open(os.path.join(art, sub, "claude.json"), "w").write("{}")
+        for name in ("merged.json", "final-review.md", "diff.patch", "snapshot.json"):
+            open(os.path.join(art, name), "w").write("x")
+        MOD._clear_artifacts(art, (os.path.join(art, "merged.json"),
+                                   os.path.join(art, "final-review.md"),
+                                   os.path.join(art, "nope.json")))
+        self.assertEqual(sorted(os.listdir(art)),
+                         ["diff.patch", "round1", "round2", "snapshot.json"])
+        self.assertEqual(os.listdir(os.path.join(art, "round1")), [])
+
+    def test_the_empty_report_names_who_delivered_and_who_did_not(self):
+        text = MOD._empty_report(7, ["claude"], {"codex": "no usable findings file"})
+        self.assertIn("# PR #7 cross-review", text)
+        self.assertIn("No findings: claude reviewed", text)
+        self.assertIn("Did not deliver", text)
+        self.assertIn("`codex` - no usable findings file", text)
+
+    def test_the_empty_report_says_nothing_of_failures_when_there_are_none(self):
+        text = MOD._empty_report(7, ["claude", "codex", "opencode"], {})
+        self.assertIn("claude, codex, opencode reviewed", text)
+        self.assertNotIn("Did not deliver", text)
+
+    def test_a_report_has_to_exist_and_have_something_in_it(self):
+        missing = os.path.join(self.dir, "final-review.md")
+        self.assertFalse(MOD._report_is_usable(missing))
+        open(missing, "w").write("# PR #1 cross-review\n")
+        self.assertFalse(MOD._report_is_usable(missing))
+        open(missing, "w").write("# PR #1 cross-review\n\n" + "x" * 300)
+        self.assertTrue(MOD._report_is_usable(missing))
 
 
 class JuryTargets(unittest.TestCase):
