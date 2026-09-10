@@ -184,6 +184,15 @@ def _dedup(findings):
                 and kept["category"] == finding["category"]
                 and kept["line"] is not None
                 and kept["line"] == finding["line"]
+                # And from a reviewer that has not already spoken here. One harness
+                # filing two defects at one line is ordinary output, not a slip -- a
+                # missing bounds check and an ignored error, same line, same category --
+                # and collapsing them deleted the second from the run: this path builds
+                # no `merged_from`, so its title, detail and scenario reached neither
+                # the jury nor the arbiter, and `independent_sources` stayed 1 so
+                # nothing downstream could tell. `_apply_merges` refuses exactly this
+                # grouping fifty lines down; the automatic pass used to do it silently.
+                and not set(kept["sources"]) & set(finding["sources"])
             )
             if same_place:
                 for src in finding["sources"]:
@@ -235,16 +244,33 @@ def _apply_merges(deduped, groups):
             for src in extra["sources"]:
                 if src not in keeper["sources"]:
                     keeper["sources"].append(src)
-            keeper["merged_ids"] = keeper.get("merged_ids", []) + [extra["id"]]
-            # The other write-ups, not just their ids. A merge that spans every harness
-            # leaves nobody eligible to judge the survivor -- `_jury_targets` excludes
-            # each of them as an author -- so the arbiter is the only reader who can
-            # still ask whether these really are one defect, and it needs the words to
-            # do it. Losing them also lost whatever the folded finding said better.
-            keeper["merged_from"] = keeper.get("merged_from", []) + [
-                {k: extra[k] for k in ("id", "sources", "file", "line",
-                                       "title", "detail", "failure_scenario")}]
+            # Everything the folded member carried, not just the member. Groups overlap
+            # -- [["claude-1","codex-1"],["opencode-1","claude-1"]] is ordinary model
+            # output and the prompt says nothing against it -- so a member being folded
+            # here may already hold write-ups of its own, and copying seven fields off
+            # it dropped those without trace: not in `merged_from`, not even an id in
+            # `merged_ids`. That is the loss finding 11 was written to stop, one level
+            # down.
+            keeper["merged_ids"] = (keeper.get("merged_ids", []) + [extra["id"]]
+                                    + extra.get("merged_ids", []))
+            # The write-ups themselves, not just their ids. A merge that spans every
+            # harness leaves nobody eligible to judge the survivor -- `_jury_targets`
+            # excludes each of them as an author -- so the arbiter is the only reader
+            # who can still ask whether these really are one defect, and it needs the
+            # words to do it.
+            keeper["merged_from"] = (keeper.get("merged_from", [])
+                                     + [{k: extra[k] for k in
+                                         ("id", "sources", "file", "line",
+                                          "title", "detail", "failure_scenario")}]
+                                     + extra.get("merged_from", []))
             dropped.add(extra["id"])
+        # Folded, not inherited. `members[0]` is whichever id the merge model happened
+        # to write first, and nothing in the prompt fixes that order -- so a finding two
+        # harnesses had reported independently at the same line lost its corroboration
+        # by being listed second, arriving at the arbiter neither corroborated nor,
+        # since its sources now spanned every harness, judged by anyone.
+        keeper["corroborated"] = any(m["corroborated"] for m in members)
+        keeper["independent_sources"] = max(m["independent_sources"] for m in members)
         # Deliberately not `corroborated`: one model decided these describe the same
         # defect. That is a claim for the arbiter to weigh, not the independent
         # agreement that earns a finding a pass on the jury.
@@ -466,7 +492,11 @@ def _pr_lock(directory):
 # letting it be collected, releases the lock.
 RUN_LOCK = _pr_lock("pr-%d" % PR)
 if RUN_LOCK is None:
-    raise SystemExit("a review of %s#%d is already running" % (SLUG_PATH, PR))
+    # "Already running" was not always true: pruning a finished sibling holds that PR's
+    # lock across the `git worktree remove`, so a review starting for it in that
+    # sub-second window was refused with a statement about itself that was false.
+    raise SystemExit("%s#%d is busy: a review of it is running, or another run is "
+                     "clearing its checkout. Try again." % (SLUG_PATH, PR))
 
 
 def _has_report(directory):
@@ -679,17 +709,21 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
 round1 = {key: found for key, found, _ in _r1}
 failures = {key: err for key, _, err in _r1 if err}
 
-if len(failures) == len(HARNESSES):
-    # Exit non-zero so the run is recorded FAILED. Exiting 0 here would file a run in
-    # which nothing was reviewed as `completed`, and `./cao review` would return success.
-    emit_output({"pr": PR, "error": "every harness failed in round 1", "failures": failures})
-    raise SystemExit(1)
-
-
 def _finish(code):
     """Exit, saying on stderr what a failed run's dropped output would have said."""
     sys.stderr.write(_exit_note(code, FINAL, failures))
     raise SystemExit(code)
+
+
+if len(failures) == len(HARNESSES):
+    # Exit non-zero so the run is recorded FAILED. Exiting 0 here would file a run in
+    # which nothing was reviewed as `completed`, and `./cao review` would return success.
+    # Through `_finish` like every other failing exit: a bare SystemExit(1) prints
+    # nothing, and CAO drops the sentinel emit_output just wrote, so a run where all
+    # three harnesses came back `completed` having written nothing -- not a step failure,
+    # so nothing is journaled either -- was recorded FAILED with the reason nowhere.
+    emit_output({"pr": PR, "error": "every harness failed in round 1", "failures": failures})
+    _finish(1)
 
 
 # --- stage 1: normalize and dedup ------------------------------------------------

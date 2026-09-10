@@ -222,6 +222,14 @@ class Dedup(unittest.TestCase):
         out = MOD._dedup([_finding("claude", 1, line=None), _finding("codex", 1, line=None)])
         self.assertEqual(len(out), 2)
 
+    def test_one_harness_filing_twice_at_one_line_keeps_both(self):
+        # A missing bounds check and an ignored error can share a line and a category.
+        # Collapsing them deleted the second from the run outright: this path builds no
+        # `merged_from`, so nothing downstream ever saw its words.
+        out = MOD._dedup([_finding("claude", 1), _finding("claude", 2)])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
+        self.assertEqual(out[0]["independent_sources"], 1)
+
     def test_one_harness_alone_is_not_corroborated(self):
         out = MOD._dedup([_finding("claude", 1)])
         self.assertFalse(out[0]["corroborated"])
@@ -287,6 +295,33 @@ class ApplyMerges(unittest.TestCase):
         self.assertEqual(deduped[0]["sources"], ["claude", "codex"])
         out = MOD._apply_merges(deduped, [["claude-1", "claude-2"]])
         self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
+
+    def test_corroboration_survives_being_listed_second(self):
+        # `members[0]` is whichever id the merge model wrote first, and nothing fixes
+        # that order. Inheriting the keeper's flags cost a finding two harnesses had
+        # found independently both its corroboration and, since its sources then spanned
+        # every harness, any judge at all.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
+                              _finding("opencode", 1, line=400)])
+        out = MOD._apply_merges(deduped, [["opencode-1", "claude-1"]])
+        self.assertEqual([f["id"] for f in out], ["opencode-1"])
+        self.assertTrue(out[0]["corroborated"])
+        self.assertEqual(out[0]["independent_sources"], 2)
+        # The corroborated member's own history comes with it.
+        self.assertIn("codex-1", out[0]["merged_ids"])
+
+    def test_overlapping_groups_keep_what_the_first_one_folded(self):
+        # [["claude-1","codex-1"],["opencode-1","claude-1"]] is ordinary model output.
+        # Copying seven fields off claude-1 dropped codex-1 entirely -- not in
+        # merged_from, not even an id in merged_ids.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200),
+                              _finding("opencode", 1, line=400)])
+        out = MOD._apply_merges(deduped, [["claude-1", "codex-1"],
+                                          ["opencode-1", "claude-1"]])
+        self.assertEqual([f["id"] for f in out], ["opencode-1"])
+        self.assertEqual(sorted(m["id"] for m in out[0]["merged_from"]),
+                         ["claude-1", "codex-1"])
+        self.assertEqual(sorted(out[0]["merged_ids"]), ["claude-1", "codex-1"])
 
     def test_merged_findings_are_json_serialisable(self):
         # merged.json is what the arbiter reads; a field the encoder chokes on would

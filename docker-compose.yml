@@ -30,8 +30,10 @@ services:
     # DEEPSEEK_API_KEY in the environment. Kept in .env (gitignored), not here.
     # The mapping form because a plain-string entry is mandatory: .env is gitignored and
     # the Quick start opens with `./cao up`, so on a fresh clone compose aborted before
-    # creating anything, and anyone who did not want the DeepSeek harness at all could
-    # not start the stack. Absent, the other two harnesses just run without it.
+    # creating anything, and the stack could not be started at all. Note what a missing
+    # key does NOT do: `HARNESSES` in the workflow is a constant, so the opencode steps
+    # still run and fail, and the review comes back with them in `failures`. `./cao
+    # status` says whether the key reached the container.
     env_file:
       - path: .env
         required: false
