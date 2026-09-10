@@ -236,6 +236,14 @@ def _apply_merges(deduped, groups):
                 if src not in keeper["sources"]:
                     keeper["sources"].append(src)
             keeper["merged_ids"] = keeper.get("merged_ids", []) + [extra["id"]]
+            # The other write-ups, not just their ids. A merge that spans every harness
+            # leaves nobody eligible to judge the survivor -- `_jury_targets` excludes
+            # each of them as an author -- so the arbiter is the only reader who can
+            # still ask whether these really are one defect, and it needs the words to
+            # do it. Losing them also lost whatever the folded finding said better.
+            keeper["merged_from"] = keeper.get("merged_from", []) + [
+                {k: extra[k] for k in ("id", "sources", "file", "line",
+                                       "title", "detail", "failure_scenario")}]
             dropped.add(extra["id"])
         # Deliberately not `corroborated`: one model decided these describe the same
         # defect. That is a claim for the arbiter to weigh, not the independent
@@ -254,6 +262,62 @@ def _jury_targets(deduped, key):
     corroboration was frozen in `_dedup`: a merged finding used to skip round 2 outright.
     """
     return [f for f in deduped if not f["corroborated"] and key not in f["sources"]]
+
+
+def _worktrees_to_drop(entries, own, has_report, take_lock):
+    """Which sibling checkouts may be removed, each with the lock that keeps it safe.
+
+    A report on disk is not proof the review is over: a re-review of that PR finds its
+    diff and worktree already there and skips setup, so last time's final-review.md sits
+    beside three agents at work. The lock is the live signal. It stays HELD in what comes
+    back -- releasing it here would reopen the window this closes, between the decision
+    and the `git worktree remove` the caller makes on it.
+    """
+    keep = []
+    for entry in sorted(entries):
+        if entry == own or not entry.startswith("pr-"):
+            continue
+        if not has_report(entry):
+            continue
+        held = take_lock(entry)
+        if held is not None:
+            keep.append((entry, held))
+    return keep
+
+
+def _head_mismatch(pr, meta, checked_out):
+    """The refusal for a run whose diff and checkout disagree, or None when they agree.
+
+    `gh pr diff` reads the live PR, so it can describe a commit newer than the one that
+    was fetched -- reviewing a diff against files it does not match is the failure this
+    stage exists to prevent, and caching the mismatch would hand it to every resume too.
+    """
+    meta_head = json.loads(meta).get("headRefOid", "")
+    if meta_head == checked_out:
+        return None
+    return ("PR #%d moved while it was being set up: the worktree is at %s, the diff "
+            "describes %s. Re-run -- the new head is picked up then."
+            % (pr, checked_out[:12], meta_head[:12]))
+
+
+def _exit_note(code, final, failures):
+    """What a failing run writes to stderr on its way out, or "" when it succeeded.
+
+    A non-zero exit makes CAO drop the sentinel `emit_output` just wrote -- the run is
+    recorded FAILED and its output goes with it -- and the stderr tail is what the run
+    record keeps in its place. So it carries the two things a reader is left needing:
+    which stage did not deliver, and where the report that WAS produced is. The path
+    only when the file exists, because the arbiter failing to write it is one of the
+    ways to get here and naming a path that is not there is worse than saying nothing.
+    """
+    if not code:
+        return ""
+    note = []
+    if failures:
+        note.append("failures: %s\n" % json.dumps(failures, sort_keys=True))
+    if os.path.exists(final):
+        note.append("final review: %s\n" % final)
+    return "".join(note)
 
 
 def _take_lock(path):
@@ -336,10 +400,18 @@ def _report_is_usable(path):
     Both rounds verify their artifact on disk; this is that check for the one deliverable
     the run exists to produce, which had none -- a step that replied in the terminal
     without writing the file was reported as a success pointing at a path that does not
-    exist. A size floor rather than existence alone, because a truncated file is the
-    same non-delivery.
+    exist.
+
+    Structural, not a size floor. The 200-byte floor it replaces failed a report that
+    was short because there was little to say: when the jury rejects every finding, the
+    honest review is a heading and one sentence, and a correct run was then recorded
+    FAILED with its structured output dropped. Non-delivery looks like no file, an empty
+    one, or a lone heading -- two lines with something on them separate that from brevity.
     """
-    return os.path.exists(path) and os.path.getsize(path) >= 200
+    if not os.path.exists(path):
+        return False
+    text = open(path, encoding="utf-8", errors="replace").read()
+    return len([line for line in text.splitlines() if line.strip()]) >= 2
 
 
 # Everything above this line is pure: no network, no filesystem, no clock. Everything
@@ -397,32 +469,28 @@ if RUN_LOCK is None:
     raise SystemExit("a review of %s#%d is already running" % (SLUG_PATH, PR))
 
 
+def _has_report(directory):
+    """Whether some review of that PR has already written its report."""
+    return os.path.exists(
+        os.path.join(WORKSPACE, ".cao-review", SLUG, directory, "final-review.md"))
+
+
 def _prune_finished_worktrees():
-    """Drop checkouts of this repo's other PRs whose review already produced a report.
+    """Drop checkouts of this repo's other PRs whose review is finished and not running.
 
     Disk hygiene only: artifacts, final-review.md included, are never touched -- just
     the working copy, which is reproducible from the bare clone. Completion is read off
     the filesystem rather than from a timestamp, because a workflow script that consults
-    the clock diverges on resume.
+    the clock diverges on resume. Which entries qualify is `_worktrees_to_drop`'s
+    decision, and it hands back each one's lock still held: the removal happens inside
+    that lock, not after it.
     """
     _git("worktree", "prune", cwd=BARE)
     root = os.path.join(WORKSPACE, ".cao-worktrees", SLUG)
     if not os.path.isdir(root):
         return
-    for entry in sorted(os.listdir(root)):
-        if entry == "pr-%d" % PR or not entry.startswith("pr-"):
-            continue
-        report = os.path.join(WORKSPACE, ".cao-review", SLUG, entry, "final-review.md")
-        if not os.path.exists(report):
-            continue
-        # A report is not proof that the review is over. A re-review of that PR finds
-        # its diff and its worktree already on disk and skips this stage entirely, so
-        # last time's final-review.md sits there for the whole run while three agents
-        # work in the checkout -- and `worktree remove --force` would pull it out from
-        # under them. The lock is the live signal; when it is held, leave the checkout.
-        held = _pr_lock(entry)
-        if held is None:
-            continue
+    for entry, held in _worktrees_to_drop(os.listdir(root), "pr-%d" % PR,
+                                          _has_report, _pr_lock):
         _git("worktree", "remove", "--force", os.path.join(root, entry), cwd=BARE)
         held.close()
 
@@ -494,25 +562,19 @@ if _provisioned:
         ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
         capture_output=True, text=True, check=True,
     ).stdout
-    # The metadata is read LAST, and that ordering is the check. `gh pr diff` reads the
-    # live PR, so it can describe a commit newer than the one that was fetched --
-    # reviewing a diff against files it does not match is the failure this whole stage
-    # exists to prevent, and caching the mismatch would hand it to every resume as well.
-    # Asking for the head before the diff only proved the PR had not moved by then and
-    # left the fetch-to-diff window wide open; asking after covers everything up to the
-    # diff, and a push landing later than that shows up as a mismatch and refuses the
-    # run, which is the safe direction to be wrong in.
+    # The metadata is read LAST, and that ordering is the check. Asking for the head
+    # before the diff only proved the PR had not moved by then and left the
+    # fetch-to-diff window wide open; asking after covers everything up to the diff, and
+    # a push landing later than that shows up as a mismatch and refuses the run, which
+    # is the safe direction to be wrong in.
     _meta = subprocess.run(
         ["gh", "pr", "view", str(PR), "--repo", SLUG_PATH, "--json",
          "title,body,url,headRefName,headRefOid,baseRefName,files"],
         capture_output=True, text=True, check=True,
     ).stdout
-    _meta_head = json.loads(_meta).get("headRefOid", "")
-    if _meta_head != _checked_out:
-        raise SystemExit(
-            "PR #%d moved while it was being set up: the worktree is at %s, the diff "
-            "describes %s. Re-run -- the new head is picked up then."
-            % (PR, _checked_out[:12], _meta_head[:12]))
+    _moved = _head_mismatch(PR, _meta, _checked_out)
+    if _moved:
+        raise SystemExit(_moved)
     HEAD_OID = _checked_out
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
@@ -625,16 +687,8 @@ if len(failures) == len(HARNESSES):
 
 
 def _finish(code):
-    """Exit, and when the run failed say where the report it did produce is.
-
-    A non-zero exit makes CAO drop the sentinel `emit_output` just wrote -- the run is
-    recorded FAILED and its output goes with it -- so the one thing a reader still needs
-    goes to stderr, which is what the run record keeps in its place. Only when the file
-    is really there: the arbiter failing to write it is one of the ways to get here, and
-    naming a path that does not exist is worse than saying nothing.
-    """
-    if code and os.path.exists(FINAL):
-        sys.stderr.write("final review: %s\n" % FINAL)
+    """Exit, saying on stderr what a failed run's dropped output would have said."""
+    sys.stderr.write(_exit_note(code, FINAL, failures))
     raise SystemExit(code)
 
 
@@ -687,7 +741,12 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
 # than two of two was -- the finding had a real chance to go uncorroborated and did not.
 # The semantic merge above unions `sources` too, and that is a different thing: one
 # model's opinion that two write-ups are the same defect. It sets `merged_semantically`
-# and nothing skips the jury on it.
+# and never sets this flag. It can still cost a finding its jury, though, and quietly:
+# a group spanning all three harnesses leaves every one of them an author, so
+# `_jury_targets` finds nobody eligible and the finding reaches the arbiter `unjudged`.
+# That is a real state, not an error -- what it must not be is silent, so it is counted
+# in the output and explained in the arbiter prompt, with the folded write-ups attached
+# for the one reader still able to weigh them.
 for f in deduped:
     f["sources"] = sorted(f["sources"])
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
@@ -846,8 +905,13 @@ ARBITER_PROMPT = (
     "harnesses reported it), `corroborated` (true when two or more reported it "
     "independently, at the same line, in round 1), `merged_semantically` (true when a "
     "merge step judged separate write-ups to be one defect -- one model's opinion, not "
-    "independent agreement), `verdicts` keyed by judging harness, and `ruling` "
-    "summarising them. Three harnesses "
+    "independent agreement, with the other write-ups kept under `merged_from`), "
+    "`verdicts` keyed by judging harness, and `ruling` "
+    "summarising them. A `ruling` of `unjudged` means no harness was eligible to judge "
+    "it -- every one of them is among its `sources`, which happens when a merge group "
+    "spanned all three. Nobody has validated that finding: read the code yourself, and "
+    "read `merged_from` to decide whether those write-ups really are one defect before "
+    "you report them as one. Three harnesses "
     "ran: Claude, Codex and OpenCode/DeepSeek. The diff is at %s and PR metadata at %s.\n\n"
     "Resolve the material: drop rejected findings unless the rejection is plainly wrong "
     "(say so if you overrule one), rank what survives by real severity rather than by the "
@@ -887,6 +951,9 @@ emit_output({
     "corroborated": len([f for f in deduped if f["corroborated"]]),
     "confirmed": len([f for f in deduped if f["ruling"] == "confirmed"]),
     "split": len([f for f in deduped if f["ruling"] == "split"]),
+    # Nobody was eligible to judge these: every harness is among their sources. Counted
+    # because a run that produces one is not the run the pipeline advertises.
+    "unjudged": len([f for f in deduped if f["ruling"] == "unjudged"]),
     "failures": failures,
 })
 

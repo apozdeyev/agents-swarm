@@ -361,13 +361,84 @@ class StageZero(unittest.TestCase):
     def test_a_report_has_to_exist_and_have_something_in_it(self):
         missing = os.path.join(self.dir, "final-review.md")
         self.assertFalse(MOD._report_is_usable(missing))
+        open(missing, "w").write("")
+        self.assertFalse(MOD._report_is_usable(missing))
         open(missing, "w").write("# PR #1 cross-review\n")
         self.assertFalse(MOD._report_is_usable(missing))
-        open(missing, "w").write("# PR #1 cross-review\n\n" + "x" * 300)
-        self.assertTrue(MOD._report_is_usable(missing))
+
+    def test_a_short_report_is_still_a_report(self):
+        # The 200-byte floor failed this one: when the jury rejects every finding the
+        # honest review is a heading and a sentence, and the run was recorded FAILED
+        # with its structured output dropped.
+        path = os.path.join(self.dir, "final-review.md")
+        open(path, "w").write("# PR #123 cross-review\n\nNo actionable defects remain; "
+                              "both judges rejected the sole finding.\n")
+        self.assertLess(os.path.getsize(path), 200)
+        self.assertTrue(MOD._report_is_usable(path))
+
+    def test_the_exit_note_carries_what_the_dropped_output_would_have(self):
+        # A non-zero exit makes CAO drop emit_output's sentinel, so stderr is the only
+        # place left to say which stage went missing and where the report is.
+        final = os.path.join(self.dir, "final-review.md")
+        open(final, "w").write("# report\n\nbody\n")
+        note = MOD._exit_note(1, final, {"claude": "no usable findings file"})
+        self.assertIn('"claude": "no usable findings file"', note)
+        self.assertIn("final review: %s" % final, note)
+        # A run that succeeded says nothing at all.
+        self.assertEqual(MOD._exit_note(0, final, {"claude": "x"}), "")
+        # And a run with no report does not name one.
+        note = MOD._exit_note(1, os.path.join(self.dir, "nope.md"), {"arbiter": "silent"})
+        self.assertIn("arbiter", note)
+        self.assertNotIn("final review:", note)
+
+    def test_a_held_lock_keeps_a_siblings_checkout(self):
+        # Inverting this is the one regression that destroys work in progress: the
+        # worktree three agents are reading gets removed out from under them.
+        entries = ["pr-1", "pr-2", "pr-7", "notes.txt"]
+        taken = []
+
+        def take(entry):
+            if entry == "pr-7":
+                return None          # another run is reviewing pr-7 right now
+            handle = type("H", (), {"close": lambda self: taken.append(entry)})()
+            return handle
+
+        drop = MOD._worktrees_to_drop(entries, "pr-2", lambda e: True, take)
+        self.assertEqual([entry for entry, _ in drop], ["pr-1"])
+        # The lock comes back HELD -- the removal has to happen inside it.
+        self.assertEqual(taken, [])
+
+    def test_only_reviewed_siblings_are_dropped(self):
+        entries = ["pr-1", "pr-2", "pr-3"]
+        take = lambda e: type("H", (), {"close": lambda self: None})()
+        drop = MOD._worktrees_to_drop(entries, "pr-2", lambda e: e == "pr-3", take)
+        self.assertEqual([entry for entry, _ in drop], ["pr-3"])
+
+    def test_a_moved_head_is_refused_by_name(self):
+        meta = json.dumps({"headRefOid": "b" * 40, "title": "t"})
+        self.assertIsNone(MOD._head_mismatch(2, json.dumps({"headRefOid": "a" * 40}), "a" * 40))
+        message = MOD._head_mismatch(2, meta, "a" * 40)
+        self.assertIn("PR #2 moved", message)
+        self.assertIn("a" * 12, message)
+        self.assertIn("b" * 12, message)
 
 
 class JuryTargets(unittest.TestCase):
+    def test_a_merge_across_all_three_leaves_nobody_to_judge(self):
+        # Not a bug to be silenced: every harness authored part of it, so none can judge
+        # it independently. What the run must not do is call that a jury.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200),
+                              _finding("opencode", 1, line=400)])
+        merged = MOD._apply_merges(deduped, [["claude-1", "codex-1", "opencode-1"]])
+        self.assertEqual(len(merged), 1)
+        for key in ("claude", "codex", "opencode"):
+            self.assertEqual(MOD._jury_targets(merged, key), [])
+        # Which is why the folded write-ups have to survive: the arbiter is the only
+        # reader left who can ask whether these are one defect.
+        self.assertEqual([m["id"] for m in merged[0]["merged_from"]],
+                         ["codex-1", "opencode-1"])
+        self.assertEqual(merged[0]["merged_from"][0]["title"], "t")
+
     def _merged(self):
         deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
         return MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
