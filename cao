@@ -17,7 +17,8 @@ usage: ./cao <command>
                     (opencode/DeepSeek needs no login: set DEEPSEEK_API_KEY in .env)
   shell             bash shell inside the container
   launch [args]     start a supervisor session (passes args to `cao launch`)
-  review <pr-url>   cross-review a PR with Claude, Codex and OpenCode
+  review <pr-url>   cross-review a PR with Claude, Codex and OpenCode;
+                    the report lands in reports/<name>/<pr>/
   review <owner/name> <pr>
                     same, given repo and number separately
   ui                open the web UI
@@ -59,8 +60,26 @@ case "$cmd" in
       *)   usage_review ;;
     esac
     case "$pr" in ''|*[!0-9]*) usage_review ;; esac
+    # The container has no bind mount, so a report nobody copies out lives only in a
+    # volume. Keyed by name and PR, the layout reports/ already holds.
+    dest="reports/${repo##*/}/$pr"
+    mkdir -p "$dest"
+    rc=0
     docker compose exec -T "$C" cao workflow run pr_cross_review --wait --json \
-      --input "repo=$repo" --input "pr=$pr" ;;
+      --input "repo=$repo" --input "pr=$pr" | tee "$dest/run-summary.json" || rc=$?
+    final=$(jq -r '.output.final_review // empty' "$dest/run-summary.json" 2>/dev/null || true)
+    if [ -z "$final" ]; then
+      echo "no report produced; run summary kept in $dest/run-summary.json" >&2
+      exit 1
+    fi
+    docker compose cp "$C:$final" "$dest/final-review.md"
+    # A rerun after new commits overwrites final-review.md in the container, so pin a
+    # copy to the head it describes before the next run takes the name.
+    head=$(docker compose exec -T "$C" cat "$(dirname "$final")/snapshot.json" 2>/dev/null \
+      | jq -r '.head // empty' || true)
+    if [ -n "$head" ]; then cp "$dest/final-review.md" "$dest/final-review.at-${head:0:8}.md"; fi
+    echo "report: $dest/final-review.md"
+    exit "$rc" ;;
   launch)
     docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
     docker compose exec "$C" cao launch --agents code_supervisor "$@" ;;

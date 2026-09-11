@@ -129,6 +129,18 @@ genuinely unsettled. Findings reach the judges anonymised — no harness name, n
 reporter's own confidence — because a judge told who wrote a claim is not judging it
 independently.
 
+The report is copied out when the run finishes — there is no bind mount, so what stays
+in the container stays in a volume:
+
+```
+reports/<name>/<pr>/final-review.md            the report
+reports/<name>/<pr>/final-review.at-<sha>.md   pinned to the head it reviewed
+reports/<name>/<pr>/run-summary.json           the workflow's own JSON result
+```
+
+Reviewing the same PR again after new commits overwrites `final-review.md`, in the
+container and here; the `at-<sha>` copy is what keeps the older report.
+
 ### The checkout
 
 Reviewing a diff while reading files from some other branch produces confident nonsense,
