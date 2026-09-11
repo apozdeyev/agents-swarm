@@ -494,5 +494,93 @@ class JuryTargets(unittest.TestCase):
             self.assertEqual(MOD._jury_targets(deduped, key), [])
 
 
+class SecondAttempt(unittest.TestCase):
+    """`_twice`: what makes a step worth running again, and what does not.
+
+    It exists because a step can come back `completed` having written nothing -- CAO ends
+    one on a single reading of COMPLETED, and a model thinking between tool calls looks
+    exactly like a pane that has gone quiet. These pin the parts that would fail silently
+    if they drifted: exactly two attempts and no more, an honest empty answer is not one
+    of them, the retry's id carries the generation so a resume can repair the case this
+    exists for, and the mark names the step rather than the attempt.
+    """
+
+    def _harness(self, writes_on=(), errors=None):
+        """A `run`/`load` pair over a fake disk, plus the call and mark logs.
+
+        `run` writes a finding for any step id in `writes_on` and returns the error text
+        in `errors` for any id that has one, exactly as `_step_or_error` would.
+        """
+        disk, calls, marked = [], [], []
+        errors = errors or {}
+
+        def run(step_id):
+            calls.append(step_id)
+            if step_id in errors:
+                return errors[step_id]
+            if step_id in writes_on:
+                disk.append(["a finding"])
+            return None
+
+        return run, (lambda: disk[-1] if disk else None), calls, marked
+
+    def test_a_step_that_delivered_is_not_run_again(self):
+        run, load, calls, marked = self._harness(writes_on={"r1-codex"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (["a finding"], None))
+        self.assertEqual(calls, ["r1-codex"])
+        self.assertEqual(marked, [])
+
+    def test_a_silent_step_is_run_once_more_and_the_retry_carries_the_generation(self):
+        run, load, calls, marked = self._harness(writes_on={"r1-codex-retry-7"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (["a finding"], None))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        # The mark names the step, not the attempt: what matters is that it needed one.
+        self.assertEqual(marked, ["r1-codex"])
+
+    def test_a_resume_gets_a_fresh_retry_id(self):
+        """A fixed one would be replayed from the journal, so no agent would run."""
+        first = self._harness()
+        MOD._twice(first[0], first[1], "r1-codex", "1", first[3].append)
+        later = self._harness()
+        MOD._twice(later[0], later[1], "r1-codex", "2", later[3].append)
+        self.assertEqual(first[2][1], "r1-codex-retry-1")
+        self.assertEqual(later[2][1], "r1-codex-retry-2")
+
+    def test_two_silent_attempts_are_all_it_gets(self):
+        run, load, calls, marked = self._harness()
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, None))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        self.assertEqual(marked, ["r1-codex"])
+
+    def test_an_empty_answer_is_an_answer(self):
+        """Round 1 delivers [] for "found nothing"; round 2 hands _twice None instead."""
+        for empty in ([], {}, ""):
+            with self.subTest(empty=empty):
+                calls, marked = [], []
+                value, err = MOD._twice(lambda step_id: calls.append(step_id),
+                                        lambda: empty, "r1-codex", "7", marked.append)
+                self.assertEqual((value, err), (empty, None))
+                self.assertEqual(calls, ["r1-codex"])
+                self.assertEqual(marked, [])
+
+    def test_a_first_attempt_that_failed_is_not_retried(self):
+        """A step that raised is a different thing from a step that stayed silent."""
+        run, load, calls, marked = self._harness(errors={"r1-codex": "boom"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, "boom"))
+        self.assertEqual(calls, ["r1-codex"])
+        self.assertEqual(marked, [])
+
+    def test_a_retry_that_failed_surfaces_its_error(self):
+        run, load, calls, marked = self._harness(errors={"r1-codex-retry-7": "boom"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, "boom"))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        self.assertEqual(marked, ["r1-codex"])
+
+
 if __name__ == "__main__":
     unittest.main()

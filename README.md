@@ -148,8 +148,12 @@ scraped off the pane only once output goes quiet — which is also what a model 
 between tool calls looks like, so a live review can be torn down mid-file (seen at 13s,
 32s and 61s, on all three harnesses). Only non-delivery is retried: "reviewed, found
 nothing" is an empty findings list, never a missing file, and a judge that ruled on some
-of the findings is reported as partial rather than re-run. The second attempt uses step
-id `<id>-retry`, and the run's JSON output names what needed one under `retried`.
+of the findings is reported as partial rather than re-run. The second attempt's step id
+carries the run's generation (`<id>-retry-<generation>`), which CAO bumps on every
+resume: a fixed id would be replayed from the journal, so a resume of a run that lost a
+harness twice would repair nothing. What needed a second attempt is recorded as an empty
+file under `<artifacts>/retried/` and reported in the run's JSON output as `retried` —
+on disk rather than in memory, so a resume still knows.
 
 The report is copied out when the run finishes — there is no bind mount, so what stays
 in the container stays in a volume:

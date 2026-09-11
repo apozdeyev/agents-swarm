@@ -67,6 +67,10 @@ REPO = WT
 # The run this execution belongs to. CAO sets it and keeps it across a resume, so it
 # names one review from end to end. Absent only when the script is run by hand.
 RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "") or "no-run-id"
+# Bumped by CAO on every resume (INV-6) and handed to the script process alongside
+# the run id. It exists here for one reason, spelled out in _twice: a retry that has
+# to be repeatable across a resume cannot keep a fixed step id.
+GENERATION = os.environ.get("CAO_WORKFLOW_GENERATION", "") or "0"
 
 # Outside the checkout, so a review run never dirties the git tree. Keyed by owner as
 # well as name -- two repos of the same name from different owners are different repos
@@ -422,6 +426,50 @@ def _report_is_usable(path):
     return len([line for line in text.splitlines() if line.strip()]) >= 2
 
 
+def _twice(run, load, step_id, generation, mark):
+    """Run one step, and run it once more when it delivered nothing.
+
+    `run(step_id)` returns None when the step ran and the error text when it did not.
+    `load()` returns what the step delivered, or None for "nothing arrived". Returns
+    (value, error): value is None when error is set, and when both attempts delivered
+    nothing. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
+    id -- what is worth recording is that the step needed one, not which try it was.
+
+    Why a step that came back `completed` is run again at all: CAO ends a step on ONE
+    reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
+    requires the step to have been observed working AND three consecutive polls, its
+    COMPLETED exit requires neither), and that status is scraped off the pane only once
+    output goes quiet. A model thinking between tool calls writes nothing to the pane, so
+    the quiet reads as a finished turn: the pane is torn down mid-step and the harness
+    never writes its file. Observed on Codex at 61s and at 13s and on Claude at 32s, in
+    round 1 and in round 2 -- it is not one harness's TUI.
+
+    The generation goes into the retry's id because a fixed one cannot repair the very
+    case this exists for. A retry that silently failed too leaves a `completed` row whose
+    call fingerprint still matches, and `services/step_replay.py` rule 10 replays any such
+    row -- `recovery="idempotent"` does not force re-execution of one -- so a plain
+    `cao workflow resume` would return both calls instantly, find nothing on disk again,
+    and fail identically with no agent having run. A generation-stamped id is new on each
+    resume and therefore executes, while the first attempt keeps its stable id and still
+    replays when it really did deliver.
+
+    What counts as delivered is the caller's to decide, because the two rounds disagree:
+    round 1 takes an empty findings list as an answer -- "I looked and found nothing" --
+    while for round 2 an empty verdict set means nobody voted.
+    """
+    err = run(step_id)
+    if err:
+        return None, err
+    value = load()
+    if value is not None:
+        return value, None
+    mark(step_id)
+    err = run("%s-retry-%s" % (step_id, generation))
+    if err:
+        return None, err
+    return load(), None
+
+
 # Everything above this line is pure: no network, no filesystem, no clock. Everything
 # below clones a repository and drives three model harnesses. CAO runs this file as a
 # script (`python pr_cross_review.py`, its own process), so the guard fires only for
@@ -442,6 +490,13 @@ LOCKS = os.path.join(WORKSPACE, ".cao-repos")
 
 os.makedirs(os.path.join(ART, "round1"), exist_ok=True)
 os.makedirs(os.path.join(ART, "round2"), exist_ok=True)
+# One empty file per step that had to be run twice, named after the step. On disk rather
+# than in a list, because a list is rebuilt empty by every execution: after a resume the
+# retry's own output is already there, the retry branch is never entered, and the run
+# would report no retries for a run that needed one. Everything else here derives from
+# the artifacts on disk; so does this.
+RETRIED = os.path.join(ART, "retried")
+os.makedirs(RETRIED, exist_ok=True)
 
 
 def _git(*args, **kwargs):
@@ -661,21 +716,14 @@ R1_PROMPT = (
 )
 
 
-# Why a step that came back `completed` is worth running a second time: CAO ends a step
-# on ONE reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
-# requires the step to have been observed working AND three consecutive polls, its
-# COMPLETED exit requires neither), and that status is scraped off the pane only once
-# output goes quiet. A model thinking between tool calls writes nothing to the pane, so
-# the quiet reads as a finished turn: the pane is torn down mid-step and the harness
-# never writes its file. Observed on Codex at 61s and at 13s and on Claude at 32s, in
-# round 1 and in round 2 -- it is not one harness's TUI.
-#
-# Only non-delivery is retried. "I reviewed this and found nothing" is an empty list,
-# never a missing file, so an honest silence is never re-run.
-#
-# Which steps had to be run twice. Appended from the pool threads -- list.append is
-# atomic, and the order only has to be stable by the time it is sorted for the output.
-RETRIED = []
+def _mark_retried(step_id):
+    """Record that `step_id` needed a second attempt. See RETRIED."""
+    open(os.path.join(RETRIED, step_id), "w").close()
+
+
+def _retried():
+    """Which steps needed one, across every execution of this run."""
+    return sorted(os.listdir(RETRIED))
 
 
 def _step_or_error(provider, agent, prompt, step_id):
@@ -700,22 +748,16 @@ def _review(spec):
     key, provider, agent = spec
     out = os.path.join(ART, "round1", "%s.json" % key)
     prompt = R1_PROMPT % (PR, REPO, DIFF, META, out, FINDING_SHAPE)
-    err = _step_or_error(provider, agent, prompt, "r1-%s" % key)
-    if err:
-        return key, [], err
     # A step can report `completed` without the work having happened -- the harnesses are
     # driven through their TUI, and a judge has been seen cut short mid-reasoning, having
     # written nothing, yet still coming back completed. So the difference between
-    # "reviewed, found nothing" and "never delivered" is read off the disk, not the state.
-    found = _load_round1(out, key)
-    if found is None:
-        # See RETRIED: nothing was delivered, and the cheapest answer to a pane torn
-        # down mid-review is to review again.
-        RETRIED.append("r1-%s" % key)
-        err = _step_or_error(provider, agent, prompt, "r1-%s-retry" % key)
-        if err:
-            return key, [], err
-        found = _load_round1(out, key)
+    # "reviewed, found nothing" and "never delivered" is read off the disk, not the state,
+    # and the second is worth one more attempt.
+    found, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
+                        lambda: _load_round1(out, key),
+                        "r1-%s" % key, GENERATION, _mark_retried)
+    if err:
+        return key, [], err
     if found is None:
         return key, [], "no usable findings file at %s" % out
     return key, found, None
@@ -741,7 +783,7 @@ if len(failures) == len(HARNESSES):
     # three harnesses came back `completed` having written nothing -- not a step failure,
     # so nothing is journaled either -- was recorded FAILED with the reason nowhere.
     emit_output({"pr": PR, "error": "every harness failed in round 1",
-                 "failures": failures, "retried": sorted(RETRIED)})
+                 "failures": failures, "retried": _retried()})
     _finish(1)
 
 
@@ -806,7 +848,7 @@ if not deduped:
     _delivered = sorted(key for key, _, err in _r1 if not err)
     open(FINAL, "w").write(_empty_report(PR, _delivered, failures))
     emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures,
-                 "retried": sorted(RETRIED)})
+                 "retried": _retried()})
     _finish(1 if failures else 0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
@@ -879,10 +921,6 @@ def _validate(spec):
     open(infile, "w").write(json.dumps(payload, indent=2))
     open(mapfile, "w").write(json.dumps(id_map, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
-    err = _step_or_error(provider, agent, prompt, "r2-%s-jury" % key)
-    if err:
-        return key, {}, err
-
     def _ruled():
         """The verdicts sitting on disk, keyed by the real finding id."""
         out = {}
@@ -897,21 +935,18 @@ def _validate(spec):
                 out[real_id] = dict(verdict, id=real_id)
         return out
 
-    ruled = _ruled()
     # Same reasoning as round 1, and this is where it actually bit: a jury step finished
     # `completed` having written no verdict file, and an empty dict here is exactly what
     # a judge with nothing to judge returns -- so the run reported no failure while a
-    # third of the jury never voted. Partial coverage is reported too, without throwing
-    # away the verdicts that did arrive.
-    if not ruled:
-        # See RETRIED. The empty case only: a judge that ruled on some of the findings
-        # did deliver, and re-running it would re-judge what it has already answered.
-        RETRIED.append("r2-%s-jury" % key)
-        err = _step_or_error(provider, agent, prompt, "r2-%s-jury-retry" % key)
-        if err:
-            return key, {}, err
-        ruled = _ruled()
-    if not ruled:
+    # third of the jury never voted. `or None` is what tells _twice that: no verdicts at
+    # all is nothing arrived, while SOME verdicts is a delivery, reported partial below
+    # rather than re-run, since re-running re-judges what the judge already answered.
+    ruled, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
+                        lambda: _ruled() or None,
+                        "r2-%s-jury" % key, GENERATION, _mark_retried)
+    if err:
+        return key, {}, err
+    if ruled is None:
         return key, {}, "judged none of %d findings: no usable verdicts at %s" % (
             len(targets), outfile)
     if len(ruled) < len(targets):
@@ -1025,7 +1060,7 @@ emit_output({
     "failures": failures,
     # Steps that came back `completed` having written nothing and were run again. Not a
     # failure -- the run recovered -- but a run that needed one did not go as designed.
-    "retried": sorted(RETRIED),
+    "retried": _retried(),
 })
 
 # Any failure, not just the arbiter's. The two report paths used to disagree on this:
