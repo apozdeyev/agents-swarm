@@ -661,26 +661,61 @@ R1_PROMPT = (
 )
 
 
+# Why a step that came back `completed` is worth running a second time: CAO ends a step
+# on ONE reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
+# requires the step to have been observed working AND three consecutive polls, its
+# COMPLETED exit requires neither), and that status is scraped off the pane only once
+# output goes quiet. A model thinking between tool calls writes nothing to the pane, so
+# the quiet reads as a finished turn: the pane is torn down mid-step and the harness
+# never writes its file. Observed on Codex at 61s and at 13s and on Claude at 32s, in
+# round 1 and in round 2 -- it is not one harness's TUI.
+#
+# Only non-delivery is retried. "I reviewed this and found nothing" is an empty list,
+# never a missing file, so an honest silence is never re-run.
+#
+# Which steps had to be run twice. Appended from the pool threads -- list.append is
+# atomic, and the order only has to be stable by the time it is sorted for the output.
+RETRIED = []
+
+
+def _step_or_error(provider, agent, prompt, step_id):
+    """Run one agent step. Returns None when it ran, the error text when it did not.
+
+    One place for the 409 rule, because every caller now has two chances to hit it: a
+    halt or a replay divergence is a human's decision, never this script's.
+    """
+    try:
+        step(provider, agent, prompt, recovery="idempotent", step_id=step_id,
+             timeout=TIMEOUT, working_directory=REPO, allowed_tools=WRITE_TOOLS)
+    except ShimHTTPError as exc:
+        if getattr(exc, "status", None) == 409:
+            raise
+        return str(exc)
+    except ShimError as exc:
+        return str(exc)
+    return None
+
+
 def _review(spec):
     key, provider, agent = spec
     out = os.path.join(ART, "round1", "%s.json" % key)
     prompt = R1_PROMPT % (PR, REPO, DIFF, META, out, FINDING_SHAPE)
-    try:
-        step(provider, agent, prompt,
-             recovery="idempotent", step_id="r1-%s" % key, timeout=TIMEOUT,
-             working_directory=REPO, allowed_tools=WRITE_TOOLS)
-    except ShimHTTPError as exc:
-        # 409 is a halt or a replay divergence -- a human decides those, never this script.
-        if getattr(exc, "status", None) == 409:
-            raise
-        return key, [], str(exc)
-    except ShimError as exc:
-        return key, [], str(exc)
+    err = _step_or_error(provider, agent, prompt, "r1-%s" % key)
+    if err:
+        return key, [], err
     # A step can report `completed` without the work having happened -- the harnesses are
     # driven through their TUI, and a judge has been seen cut short mid-reasoning, having
     # written nothing, yet still coming back completed. So the difference between
     # "reviewed, found nothing" and "never delivered" is read off the disk, not the state.
     found = _load_round1(out, key)
+    if found is None:
+        # See RETRIED: nothing was delivered, and the cheapest answer to a pane torn
+        # down mid-review is to review again.
+        RETRIED.append("r1-%s" % key)
+        err = _step_or_error(provider, agent, prompt, "r1-%s-retry" % key)
+        if err:
+            return key, [], err
+        found = _load_round1(out, key)
     if found is None:
         return key, [], "no usable findings file at %s" % out
     return key, found, None
@@ -705,7 +740,8 @@ if len(failures) == len(HARNESSES):
     # nothing, and CAO drops the sentinel emit_output just wrote, so a run where all
     # three harnesses came back `completed` having written nothing -- not a step failure,
     # so nothing is journaled either -- was recorded FAILED with the reason nowhere.
-    emit_output({"pr": PR, "error": "every harness failed in round 1", "failures": failures})
+    emit_output({"pr": PR, "error": "every harness failed in round 1",
+                 "failures": failures, "retried": sorted(RETRIED)})
     _finish(1)
 
 
@@ -769,7 +805,8 @@ if not deduped:
     # who actually delivered, and the exit code says whether anyone did not.
     _delivered = sorted(key for key, _, err in _r1 if not err)
     open(FINAL, "w").write(_empty_report(PR, _delivered, failures))
-    emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures})
+    emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures,
+                 "retried": sorted(RETRIED)})
     _finish(1 if failures else 0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
@@ -842,31 +879,38 @@ def _validate(spec):
     open(infile, "w").write(json.dumps(payload, indent=2))
     open(mapfile, "w").write(json.dumps(id_map, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
-    try:
-        step(provider, agent, prompt,
-             recovery="idempotent", step_id="r2-%s-jury" % key,
-             timeout=TIMEOUT, working_directory=REPO, allowed_tools=WRITE_TOOLS)
-    except ShimHTTPError as exc:
-        if getattr(exc, "status", None) == 409:
-            raise
-        return key, {}, str(exc)
-    except ShimError as exc:
-        return key, {}, str(exc)
-    verdicts = _read_items(outfile, "verdicts") or []
-    ruled = {}
-    for verdict in verdicts:
-        if not isinstance(verdict, dict):
-            continue
-        real_id = id_map.get(verdict.get("id"))
-        if real_id:
-            # Real id restored before anything downstream sees it: merged.json and the
-            # arbiter work in real ids, the anonymous ones exist only for the judge.
-            ruled[real_id] = dict(verdict, id=real_id)
+    err = _step_or_error(provider, agent, prompt, "r2-%s-jury" % key)
+    if err:
+        return key, {}, err
+
+    def _ruled():
+        """The verdicts sitting on disk, keyed by the real finding id."""
+        out = {}
+        for verdict in _read_items(outfile, "verdicts") or []:
+            if not isinstance(verdict, dict):
+                continue
+            real_id = id_map.get(verdict.get("id"))
+            if real_id:
+                # Real id restored before anything downstream sees it: merged.json and
+                # the arbiter work in real ids, the anonymous ones exist only for the
+                # judge.
+                out[real_id] = dict(verdict, id=real_id)
+        return out
+
+    ruled = _ruled()
     # Same reasoning as round 1, and this is where it actually bit: a jury step finished
     # `completed` having written no verdict file, and an empty dict here is exactly what
     # a judge with nothing to judge returns -- so the run reported no failure while a
     # third of the jury never voted. Partial coverage is reported too, without throwing
     # away the verdicts that did arrive.
+    if not ruled:
+        # See RETRIED. The empty case only: a judge that ruled on some of the findings
+        # did deliver, and re-running it would re-judge what it has already answered.
+        RETRIED.append("r2-%s-jury" % key)
+        err = _step_or_error(provider, agent, prompt, "r2-%s-jury-retry" % key)
+        if err:
+            return key, {}, err
+        ruled = _ruled()
     if not ruled:
         return key, {}, "judged none of %d findings: no usable verdicts at %s" % (
             len(targets), outfile)
@@ -979,6 +1023,9 @@ emit_output({
     "unjudged": len([f for f in deduped if f["ruling"] == "unjudged"]),
     "clusters": len({f["cluster"] for f in deduped if f["cluster"]}),
     "failures": failures,
+    # Steps that came back `completed` having written nothing and were run again. Not a
+    # failure -- the run recovered -- but a run that needed one did not go as designed.
+    "retried": sorted(RETRIED),
 })
 
 # Any failure, not just the arbiter's. The two report paths used to disagree on this:

@@ -142,6 +142,15 @@ genuinely unsettled. Findings reach the judges anonymised — no harness name, n
 reporter's own confidence — because a judge told who wrote a claim is not judging it
 independently.
 
+A harness that comes back `completed` having written nothing is run once more before it
+counts as a failure. CAO ends a step on a single reading of COMPLETED, and that status is
+scraped off the pane only once output goes quiet — which is also what a model thinking
+between tool calls looks like, so a live review can be torn down mid-file (seen at 13s,
+32s and 61s, on all three harnesses). Only non-delivery is retried: "reviewed, found
+nothing" is an empty findings list, never a missing file, and a judge that ruled on some
+of the findings is reported as partial rather than re-run. The second attempt uses step
+id `<id>-retry`, and the run's JSON output names what needed one under `retried`.
+
 The report is copied out when the run finishes — there is no bind mount, so what stays
 in the container stays in a volume:
 
