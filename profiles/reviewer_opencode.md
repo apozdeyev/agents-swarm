@@ -1,20 +1,15 @@
 ---
-name: reviewer_codex
-provider: codex
-description: Code Reviewer Agent in a multi-agent system (Codex harness)
+name: reviewer_opencode
+provider: opencode_cli
+model: deepseek/deepseek-v4-pro
+description: Code Reviewer Agent in a multi-agent system (OpenCode harness, DeepSeek V4 Pro)
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
-# None of CAO's installed skills are about code review -- they are its own
-# orchestration skills. An empty filter advertises none, which drops 4873 chars
-# of catalog from a 8234-char system prompt (measured, not estimated).
+# Same empty filter as the codex twin, for consistency, but it changes nothing
+# here: the opencode adapter never reads profile.skills. OpenCode discovers the
+# same skills natively through the ~/.aws/opencode/skills -> ~/.cao/skills symlink
+# that cao install creates unconditionally. Filtering those would mean fighting
+# the installer on every start, which is not worth it for prompt noise.
 skills: []
-# Codex reviewed a 1228-line diff in 65 seconds and reported nothing, while the other
-# two harnesses spent seven minutes each on the same diff and found four defects apiece.
-# It is already on gpt-6-astra, the strongest model it offers, so the shortfall is
-# effort, not capability -- and effort is the one knob that was never set. codexConfig
-# becomes `-c <key>=<value>` at launch, so this needs no global ~/.codex/config.toml.
-# Accepted values are low, medium, high and xhigh; a wrong one is rejected outright.
-codexConfig:
-  model_reasoning_effort: high
 tags:
   - review
   - code-review

@@ -20,9 +20,72 @@ if [ -n "${GIT_USER_NAME:-}" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then
   git config --global user.email "$GIT_USER_EMAIL"
 fi
 
+# The gh token alone does not authenticate `git`: clone and fetch go through git's own
+# credential helper, which `gh auth setup-git` installs into ~/.gitconfig. That file is
+# not on a volume, so it is lost on every container recreate -- re-apply it here rather
+# than leaving it to a one-off `./cao login-gh`. Guarded, because a container that has
+# not been logged in yet would otherwise abort the whole start under `set -e`.
+if gh auth status >/dev/null 2>&1; then
+  gh auth setup-git
+fi
+
+# WORKFLOW_SPEC_DIR is $CAO_HOME_DIR/workflows, which lives on the state volume.
+# Sync from the image on every start so a rebuild ships new workflow versions.
+mkdir -p "$CAO_HOME_DIR/workflows"
+for wf in /opt/cao/workflows/*.py; do
+  [ -e "$wf" ] || continue
+  cp -f "$wf" "$CAO_HOME_DIR/workflows/"
+done
+
 # Runs on every start, not just bootstrap: repos cloned since last boot need
 # their trust flag too, or the harness exits on launch.
 cao-trust /home/cao/workspace /home/cao/workspace/*/
+
+# Same reasoning as the workflow sync above, and NOT inside the bootstrap guard:
+# the sentinel survives on cao-state, so a profile added to the image after the
+# first boot would never be installed. `cao install` is idempotent (re-installing
+# an existing profile exits 0 and overwrites), so re-running it every start is safe.
+# Profiles no longer share one provider (codex twins plus the opencode twin), so read
+# it from each file's frontmatter. A profile with no provider: is a bug, not a default
+# -- fail loudly rather than silently installing it against the wrong harness.
+for profile in /opt/cao/profiles/*.md; do
+  [ -e "$profile" ] || continue
+  prov=$(sed -n 's/^provider:[[:space:]]*\([A-Za-z_][A-Za-z_0-9]*\).*/\1/p' "$profile" | head -1)
+  if [ -z "$prov" ]; then
+    echo "[entrypoint] $profile has no 'provider:' in frontmatter" >&2
+    exit 1
+  fi
+  echo "[entrypoint] installing $(basename "$profile" .md) ($prov)"
+  cao install "$profile" --provider "$prov"
+done
+
+# OpenCode enforces a workspace boundary of its own, entirely separate from CAO's
+# allowed_tools: CAO translates allowed_tools into the agent's `permission:` frontmatter,
+# which carries no `external_directory` key, so OpenCode falls back to its default of
+# prompting. Nothing answers that prompt from a workflow step, so the step burns its whole
+# timeout and fails with a 504 and no visible cause.
+#
+# Review artifacts live outside the repo by design, and agents also invent their own
+# scratch paths under /tmp, so a targeted allowlist cannot cover this -- every miss costs a
+# full step timeout. Allow the lot. This is not a loosening: CAO already runs Claude with
+# --dangerously-skip-permissions and Codex with --yolo, and the security boundary is the
+# container, which has no host bind mounts and runs non-root.
+#
+# Written after the installs because `cao install` creates the file. CAO's helper is
+# read-modify-write and preserves top-level keys it does not own.
+python3 - <<'OCPERM'
+import json
+import os
+
+path = "/home/cao/.aws/opencode/opencode.json"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+cfg = {"$schema": "https://opencode.ai/config.json"}
+if os.path.exists(path):
+    cfg = json.load(open(path))
+cfg.setdefault("permission", {})["external_directory"] = {"*": "allow"}
+with open(path, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+OCPERM
 
 SENTINEL="$CAO_HOME_DIR/.bootstrap-complete"
 
@@ -48,16 +111,27 @@ if not re.search(r'^provider:', text, re.M):
 PY
   done
 
-  for profile in /opt/cao/profiles/*.md; do
-    [ -e "$profile" ] || continue
-    echo "[entrypoint] installing $(basename "$profile" .md) (codex)"
-    cao install "$profile" --provider codex
-  done
-
   # Written last: any failure above aborts under `set -e`, leaving no sentinel,
   # so the next start retries the whole bootstrap instead of serving a broken install.
   date -u +%FT%TZ > "$SENTINEL"
   echo "[entrypoint] bootstrap complete"
 fi
+
+# The stock `reviewer` is installed from CAO's own bundle, not /opt/cao/profiles, so it
+# cannot declare `skills:` the way the codex and opencode twins do. Without a filter the
+# whole skill catalog -- all of it CAO's orchestration skills, none about code review --
+# is appended to the system prompt of every Claude review step. Same python-patch shape
+# the bootstrap uses for `provider:`, but outside the guard so an already-bootstrapped
+# volume gets it too, and after it so the file is guaranteed to exist.
+python3 - "$CAO_HOME_DIR/agent-context/reviewer.md" <<'SKILLFILTER'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+if not re.search(r'^skills:', text, re.M):
+    text = re.sub(r'^(provider: .*)$', r'\1\nskills: []', text, count=1, flags=re.M)
+    open(path, 'w').write(text)
+SKILLFILTER
 
 exec cao-server --host "${CAO_BIND_HOST:-0.0.0.0}" --port "${CAO_API_PORT:-9889}"

@@ -8,15 +8,18 @@ FROM python:3.12-slim-bookworm
 ARG CAO_VERSION=2.5.0
 ARG CLAUDE_VERSION=2.1.260
 ARG CODEX_VERSION=0.153.2
+ARG OPENCODE_VERSION=1.18.29
 ARG NODE_MAJOR=22
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_ROOT_USER_ACTION=ignore \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# procps is required by CAO for provider process detection.
+# procps is required by CAO for provider process detection. ripgrep is here because
+# Codex reaches for `rg` unprompted during a review and, without it, burns a search
+# round on exit 127 before falling back to find -exec grep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tmux git curl ca-certificates procps less gnupg \
+        tmux git curl ca-certificates procps less gnupg ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Node from NodeSource: Claude Code declares engines.node >= 22 and bookworm's
@@ -37,6 +40,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN npm install -g --no-fund --no-audit \
         "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \
+        "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force
 
 # No linux/arm64 wheel is published, so pip falls back to the sdist. That is fine:
@@ -52,6 +56,7 @@ RUN mkdir -p /opt/cao \
     && echo '{"hasCompletedOnboarding": true}' > /opt/cao/claude.json.template \
     && chmod 644 /opt/cao/claude.json.template
 COPY profiles/ /opt/cao/profiles/
+COPY workflows/ /opt/cao/workflows/
 COPY bin/cao-trust /usr/local/bin/cao-trust
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/cao-trust
@@ -60,7 +65,7 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/cao-trust
 # empty named volume from the image path including ownership; if the directory is
 # missing the volume lands root:root and the non-root user cannot write to it.
 RUN mkdir -p /home/cao/.cao /home/cao/.claude /home/cao/.codex \
-             /home/cao/.config/gh /home/cao/workspace \
+             /home/cao/.config/gh /home/cao/.aws /home/cao/workspace \
     && chown -R cao:cao /home/cao
 
 # CAO_API_HOST is deliberately NOT set: constants.py uses it both as the server

@@ -1,7 +1,8 @@
 # agents-swarm — CAO in an isolated container
 
 Runs [CAO](https://github.com/awslabs/cli-agent-orchestrator) (`cli-agent-orchestrator`)
-in Docker, driving **Claude Code** and **Codex** as harnesses.
+in Docker, driving **Claude Code**, **Codex** and **OpenCode** (DeepSeek V4 Pro)
+as harnesses.
 
 ## Why
 
@@ -68,9 +69,103 @@ unrestricted.
 ## Agents
 
 `code_supervisor`, `developer`, `reviewer`, `memory_manager` run on **Claude Code**.
-`developer_codex`, `reviewer_codex` are twins running on **Codex** — CAO stores one
-provider per profile name, so a second name is the only way to have both harnesses
-live in one session. Delegate by name from the supervisor.
+`developer_codex`, `reviewer_codex` are twins running on **Codex**, and
+`reviewer_opencode` is a third twin on **OpenCode** pinned to DeepSeek V4 Pro — CAO
+stores one provider per profile name, so a second name is the only way to have both
+harnesses live in one session. Delegate by name from the supervisor.
+
+Profiles are installed from `/opt/cao/profiles/` on **every** container start, not
+just the first: the bootstrap sentinel lives on the `cao-state` volume, so a profile
+added to the image later would otherwise never be installed. `cao install` is
+idempotent, and each profile's harness comes from its own `provider:` frontmatter.
+
+### OpenCode / DeepSeek
+
+Unlike Claude, Codex and `gh`, OpenCode has no interactive login. It enables the
+`deepseek` provider from `DEEPSEEK_API_KEY` in the environment, read from `.env`
+(gitignored) via compose:
+
+```sh
+echo 'DEEPSEEK_API_KEY=sk-...' > .env   # from https://platform.deepseek.com/
+./cao up
+./cao status                            # shows whether the key reached the container
+```
+
+The model is pinned in the profile frontmatter (`model: deepseek/deepseek-v4-pro`);
+a workflow step can override it per step.
+
+OpenCode also has a workspace boundary that CAO does not drive: `allowed_tools` becomes
+the agent's `permission:` frontmatter, which has no `external_directory` key, so any path
+outside the step's working directory raises a prompt no workflow step can answer and the
+step dies on its timeout with a bare 504. The entrypoint therefore allows
+`external_directory` outright in `opencode.json`, matching the freedom Claude and Codex
+already have here. A DeepSeek account with a zero balance
+authenticates fine and then fails inside the TUI with `Insufficient Balance` rather
+than an auth error — check `https://api.deepseek.com/user/balance` if a step times
+out with no visible cause.
+
+## Cross-review of a pull request
+
+```sh
+./cao review https://github.com/owner/name/pull/123
+./cao review owner/name 123
+```
+
+Any repository the logged-in `gh` account can read. Nothing needs to be cloned first:
+the workflow provisions the checkout itself.
+
+Claude, Codex and OpenCode/DeepSeek review the same diff independently, then sit as a
+jury over each other's findings, and a Claude arbiter writes the report.
+
+```
+clone + worktree at the PR head  →  Round 1: claude ∥ codex ∥ opencode  →
+    normalize + dedup  →  Round 2: each judges the other two  →  arbiter
+```
+
+The point is the disagreement. A finding two or more harnesses reported independently
+is already cross-confirmed and skips round 2; the contested remainder is judged by both
+harnesses that did not report it, so a `split` marks a finding whose reality is
+genuinely unsettled. Findings reach the judges anonymised — no harness name, no
+reporter's own confidence — because a judge told who wrote a claim is not judging it
+independently.
+
+### The checkout
+
+Reviewing a diff while reading files from some other branch produces confident nonsense,
+so the pipeline owns the git state:
+
+```
+~/workspace/.cao-repos/<owner>__<name>.git        bare clone, one per repository
+~/workspace/.cao-worktrees/<owner>__<name>/pr-<n> detached at refs/pull/<n>/head
+~/workspace/.cao-review/<owner>__<name>/pr-<n>/   artifacts
+```
+
+`refs/pull/<n>/head` rather than the branch name: it resolves for merged and closed PRs
+and for PRs from forks. Worktrees of *other* PRs of the same repo are removed once their
+review has produced a `final-review.md`; the artifacts stay. Bare clones are never
+removed — cheap to keep, expensive to rebuild.
+
+Concurrent reviews work: paths are keyed by owner, name and PR number, and the git
+mutations are serialised per repository by a file lock. The real ceiling is provider
+rate limits — one run already holds three live model sessions.
+
+Artifacts sit outside the checkout, so a review never dirties the git tree.
+`final-review.md` is the report; `round1/*.json`, `merged.json`, `round2/*.json` and
+`round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
+debugging the pipeline itself.
+
+Run it directly for more control:
+
+```sh
+./cao shell
+  cao workflow run pr_cross_review --run-id my-id --wait --json \
+    --input repo=owner/name --input pr=123
+  cao workflow status my-id       # progress
+  cao workflow resume my-id       # after an interruption
+```
+
+The workflow script lives at `workflows/pr_cross_review.py` and is synced into the
+container on every start, so editing it plus `./cao up` ships a new version.
 
 ## Notes and constraints
 

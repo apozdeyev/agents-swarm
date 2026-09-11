@@ -6,6 +6,7 @@ services:
         CAO_VERSION: "2.5.0"
         CLAUDE_VERSION: "2.1.260"
         CODEX_VERSION: "0.153.2"
+        OPENCODE_VERSION: "1.18.29"
     image: cao:dev
     container_name: cao
     init: true                          # reap orphaned tmux/node children
@@ -25,11 +26,20 @@ services:
       # Agents clone and edit inside the container; git refuses to commit without an identity.
       GIT_USER_NAME: "apozdeyev"
       GIT_USER_EMAIL: "anatoliy.pozdeyev@gmail.com"
+    # OpenCode has no interactive login: it enables the deepseek provider from
+    # DEEPSEEK_API_KEY in the environment. Kept in .env (gitignored), not here.
+    env_file:
+      - .env
     volumes:
       - cao-state:/home/cao/.cao        # sqlite, logs, agent-store, skills
       - claude-auth:/home/cao/.claude   # .credentials.json
       - codex-auth:/home/cao/.codex     # auth.json, config.toml
       - gh-auth:/home/cao/.config/gh    # hosts.yml
+      # CAO puts OpenCode's agents + opencode.json under ~/.aws/opencode (AWS-heritage
+      # path, nothing to do with AWS credentials). Needs a volume: a container recreate
+      # would otherwise wipe it while the bootstrap sentinel on cao-state survives, so
+      # bootstrap never re-runs and reviewer_opencode goes silently missing.
+      - opencode-config:/home/cao/.aws
       - workspace:/home/cao/workspace   # cloned repos
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9889/health"]
@@ -44,4 +54,5 @@ volumes:
   claude-auth:
   codex-auth:
   gh-auth:
+  opencode-config:
   workspace:
