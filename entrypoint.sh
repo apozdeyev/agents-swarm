@@ -41,9 +41,43 @@ done
 # their trust flag too, or the harness exits on launch.
 cao-trust /home/cao/workspace /home/cao/workspace/*/
 
+SENTINEL="$CAO_HOME_DIR/.bootstrap-complete"
+
+if [ ! -f "$SENTINEL" ]; then
+  echo "[entrypoint] bootstrapping CAO state in $CAO_HOME_DIR"
+  cao init
+
+  # `cao install` takes exactly one AGENT_SOURCE — it is not variadic.
+  # --provider is honoured for the install but NOT persisted into the stored
+  # profile, and `cao launch` falls back to kiro_cli (not installed here) when a
+  # profile names no provider. So stamp it in explicitly, the way the codex
+  # twins carry theirs, and the agent works however it is launched.
+  for agent in code_supervisor developer reviewer memory_manager; do
+    echo "[entrypoint] installing $agent (claude_code)"
+    cao install "$agent" --provider claude_code
+    python3 - "$CAO_HOME_DIR/agent-context/$agent.md" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+if not re.search(r'^provider:', text, re.M):
+    text = re.sub(r'^(name: .*)$', r'\1\nprovider: claude_code', text, count=1, flags=re.M)
+    open(path, 'w').write(text)
+PY
+  done
+
+  # Written last: any failure above aborts under `set -e`, leaving no sentinel,
+  # so the next start retries the whole bootstrap instead of serving a broken install.
+  date -u +%FT%TZ > "$SENTINEL"
+  echo "[entrypoint] bootstrap complete"
+fi
+
 # Same reasoning as the workflow sync above, and NOT inside the bootstrap guard:
 # the sentinel survives on cao-state, so a profile added to the image after the
-# first boot would never be installed. `cao install` is idempotent (re-installing
+# first boot would never be installed. Below the guard rather than above it,
+# though: on an empty cao-state volume `cao init` is what creates db/, and a
+# `cao install` that runs first against uninitialised state would abort the
+# entrypoint under `set -e` -- which `restart: unless-stopped` turns into a crash
+# loop on every fresh volume. `cao install` is idempotent (re-installing
 # an existing profile exits 0 and overwrites), so re-running it every start is safe.
 # Profiles no longer share one provider (codex twins plus the opencode twin), so read
 # it from each file's frontmatter. A profile with no provider: is a bug, not a default
@@ -87,51 +121,28 @@ with open(path, "w") as fh:
     json.dump(cfg, fh, indent=2)
 OCPERM
 
-SENTINEL="$CAO_HOME_DIR/.bootstrap-complete"
-
-if [ ! -f "$SENTINEL" ]; then
-  echo "[entrypoint] bootstrapping CAO state in $CAO_HOME_DIR"
-  cao init
-
-  # `cao install` takes exactly one AGENT_SOURCE — it is not variadic.
-  # --provider is honoured for the install but NOT persisted into the stored
-  # profile, and `cao launch` falls back to kiro_cli (not installed here) when a
-  # profile names no provider. So stamp it in explicitly, the way the codex
-  # twins carry theirs, and the agent works however it is launched.
-  for agent in code_supervisor developer reviewer memory_manager; do
-    echo "[entrypoint] installing $agent (claude_code)"
-    cao install "$agent" --provider claude_code
-    python3 - "$CAO_HOME_DIR/agent-context/$agent.md" <<'PY'
-import re, sys
-path = sys.argv[1]
-text = open(path).read()
-if not re.search(r'^provider:', text, re.M):
-    text = re.sub(r'^(name: .*)$', r'\1\nprovider: claude_code', text, count=1, flags=re.M)
-    open(path, 'w').write(text)
-PY
-  done
-
-  # Written last: any failure above aborts under `set -e`, leaving no sentinel,
-  # so the next start retries the whole bootstrap instead of serving a broken install.
-  date -u +%FT%TZ > "$SENTINEL"
-  echo "[entrypoint] bootstrap complete"
-fi
-
 # The stock `reviewer` is installed from CAO's own bundle, not /opt/cao/profiles, so it
 # cannot declare `skills:` the way the codex and opencode twins do. Without a filter the
 # whole skill catalog -- all of it CAO's orchestration skills, none about code review --
 # is appended to the system prompt of every Claude review step. Same python-patch shape
 # the bootstrap uses for `provider:`, but outside the guard so an already-bootstrapped
-# volume gets it too, and after it so the file is guaranteed to exist.
+# volume gets it too, and after it so a fresh volume has the file by then.
 python3 - "$CAO_HOME_DIR/agent-context/reviewer.md" <<'SKILLFILTER'
+import os
 import re
 import sys
 
+# Guarded on existence: the file is there only because some earlier bootstrap installed
+# the stock `reviewer`, and the loop above installs this repo's profiles alone, so a
+# volume where a CAO version bump renamed or dropped it would take a FileNotFoundError
+# here -- under `set -e`, with `restart: unless-stopped`, that is a crash loop whose
+# cause is a traceback visible only in `docker compose logs`.
 path = sys.argv[1]
-text = open(path).read()
-if not re.search(r'^skills:', text, re.M):
-    text = re.sub(r'^(provider: .*)$', r'\1\nskills: []', text, count=1, flags=re.M)
-    open(path, 'w').write(text)
+if os.path.exists(path):
+    text = open(path).read()
+    if not re.search(r'^skills:', text, re.M):
+        text = re.sub(r'^(provider: .*)$', r'\1\nskills: []', text, count=1, flags=re.M)
+        open(path, 'w').write(text)
 SKILLFILTER
 
 exec cao-server --host "${CAO_BIND_HOST:-0.0.0.0}" --port "${CAO_API_PORT:-9889}"
