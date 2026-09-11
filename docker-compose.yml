@@ -28,8 +28,15 @@ services:
       GIT_USER_EMAIL: "anatoliy.pozdeyev@gmail.com"
     # OpenCode has no interactive login: it enables the deepseek provider from
     # DEEPSEEK_API_KEY in the environment. Kept in .env (gitignored), not here.
+    # The mapping form because a plain-string entry is mandatory: .env is gitignored and
+    # the Quick start opens with `./cao up`, so on a fresh clone compose aborted before
+    # creating anything, and the stack could not be started at all. Note what a missing
+    # key does NOT do: `HARNESSES` in the workflow is a constant, so the opencode steps
+    # still run and fail, and the review comes back with them in `failures`. `./cao
+    # status` says whether the key reached the container.
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
       - cao-state:/home/cao/.cao        # sqlite, logs, agent-store, skills
       - claude-auth:/home/cao/.claude   # .credentials.json
