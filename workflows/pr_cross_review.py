@@ -202,8 +202,8 @@ def _dedup(findings):
                 # and collapsing them deleted the second from the run: this path builds
                 # no `merged_from`, so its title, detail and scenario reached neither
                 # the jury nor the arbiter, and `independent_sources` stayed 1 so
-                # nothing downstream could tell. `_apply_merges` refuses exactly this
-                # grouping fifty lines down; the automatic pass used to do it silently.
+                # nothing downstream could tell. The semantic pass below refuses this
+                # grouping too; the automatic one used to do it silently.
                 and not set(kept["sources"]) & set(finding["sources"])
             )
             if same_place:
@@ -214,9 +214,8 @@ def _dedup(findings):
                 # And its words, not just its id. Same file, same line, same category is
                 # where two harnesses agree; whether they are describing one defect is a
                 # judgement no arithmetic makes -- and this collapse is what skips round
-                # 2, so nothing downstream ever checked it. `_apply_merges` keeps folded
-                # write-ups for exactly that reason; this path dropped them, leaving the
-                # arbiter a corroboration it had no way to verify.
+                # 2, so nothing downstream ever checked it. This path dropped them,
+                # leaving the arbiter a corroboration it had no way to verify.
                 kept["merged_from"] = kept.get("merged_from", []) + [
                     {k: finding[k] for k in ("id", "sources", "file", "line",
                                              "title", "detail", "failure_scenario")}]
@@ -229,102 +228,86 @@ def _dedup(findings):
         # on their own -- same defect, same line, no model in between -- may do that.
         finding["independent_sources"] = len(finding["sources"])
         finding["corroborated"] = finding["independent_sources"] > 1
-        # Which write-ups earned corroboration, not just that someone in the cluster
-        # did. A merge below folds findings together, and the flag has to stay attached
-        # to the claim two harnesses actually filed rather than travelling to whichever
-        # one the merge model listed first.
-        finding["corroborated_by"] = [finding["id"]] if finding["corroborated"] else []
-        finding["merged_semantically"] = False
+        finding["cluster"] = ""
     return deduped
 
 
-def _apply_merges(deduped, groups):
-    """Fold each group of ids into its first member, and return what survives.
+def _mark_clusters(deduped, groups):
+    """Label the findings a merge step judged to be one defect. Nothing is folded away.
 
-    A group has to span two distinct sources. The merge prompt already forbids grouping
-    two findings from one reviewer, but nothing checked, and a group that slipped
-    through dropped its other members outright -- title, detail and failure scenario
-    gone from the run, only the id left behind in `merged_ids`.
+    Folding a group into a keeper is what this replaces, and that produced a defect in
+    four reviews out of five: the corroboration flag lost, then handed to a claim that
+    had not earned it, then the folded write-up's own history dropped, then a group's
+    whole outcome decided by which id the model happened to write first, then a second
+    group naming an already-folded id skipped without a word. Every one of them was
+    bookkeeping in service of deleting material the arbiter then could not read.
+
+    A label deletes nothing. Each finding keeps its author, so each still collects two
+    independent verdicts; the arbiter is told which of them one model considers the same
+    defect and reports them once if it agrees. Groups that overlap describe one cluster
+    between them, which is what the model said -- unless the union would put one
+    reviewer's two findings together, the grouping the merge prompt forbids, in which
+    case the later group is left out rather than grown into a wrong one.
     """
     by_id = {f["id"]: f for f in deduped}
-    dropped = set()
+    clusters = []
     for group in groups:
         if not isinstance(group, list):
             continue
-        # Unique ids, order kept. A repeated id -- an ordinary model slip, and one the
-        # prompt says nothing against -- put the same object in `members` twice, so the
-        # keeper was also members[1] and the loop dropped its own id: both findings then
-        # vanished from the run, silently, with `len(members) >= 2` satisfied by the
-        # repetition alone.
         # Only string ids: `dict.fromkeys` uses each element as a key, so one level of
-        # nesting too many -- {"merges": [[["a","b"]]]}, ordinary enough model output --
-        # raised `TypeError: unhashable type: 'list'`, and the try around the call site
-        # catches Shim errors only, so it killed the process after round 1 had been paid
-        # for. `_read_items` checks the container; this is the same check one level in,
-        # which `_load_round1` and `_validate` already do for their elements.
-        ids = dict.fromkeys(i for i in group if isinstance(i, str))
-        members = [by_id[i] for i in ids if i in by_id and i not in dropped]
-        # Every member must bring authors none of the others has. A union of two was not
-        # that test: `sources` stops being an author list once `_dedup` has run -- a
-        # finding two harnesses filed at the same line carries both names -- so a group
-        # of two Claude findings passed whenever either of them was corroborated, which
-        # is exactly the same-reviewer merge the prompt forbids.
-        authors = [s for m in members for s in m["sources"]]
-        if len(members) < 2 or len(set(authors)) != len(authors):
+        # nesting too many -- ordinary enough model output -- used to raise TypeError
+        # into module-level code and kill the run after round 1 had been paid for.
+        members = [by_id[i] for i in dict.fromkeys(i for i in group if isinstance(i, str))
+                   if i in by_id]
+        if len(members) < 2:
             continue
-        keeper = members[0]
-        for extra in members[1:]:
-            for src in extra["sources"]:
-                if src not in keeper["sources"]:
-                    keeper["sources"].append(src)
-            # Everything the folded member carried, not just the member. Groups overlap
-            # -- [["claude-1","codex-1"],["opencode-1","claude-1"]] is ordinary model
-            # output and the prompt says nothing against it -- so a member being folded
-            # here may already hold write-ups of its own, and copying seven fields off
-            # it dropped those without trace: not in `merged_from`, not even an id in
-            # `merged_ids`. That is the loss finding 11 was written to stop, one level
-            # down.
-            keeper["merged_ids"] = (keeper.get("merged_ids", []) + [extra["id"]]
-                                    + extra.get("merged_ids", []))
-            # The write-ups themselves, not just their ids. A merge that spans every
-            # harness leaves nobody eligible to judge the survivor -- `_jury_targets`
-            # excludes each of them as an author -- so the arbiter is the only reader
-            # who can still ask whether these really are one defect, and it needs the
-            # words to do it.
-            keeper["merged_from"] = (keeper.get("merged_from", [])
-                                     + [{k: extra[k] for k in
-                                         ("id", "sources", "file", "line",
-                                          "title", "detail", "failure_scenario")}]
-                                     + extra.get("merged_from", []))
-            # Carried, not transferred. `members[0]` is whichever id the merge model
-            # wrote first and nothing fixes that order, so copying the flag onto the
-            # keeper presented ITS claim -- the text that reaches the arbiter and the
-            # report -- as the one two harnesses had filed independently, when what they
-            # filed is a different write-up now folded underneath. Dropping the flag
-            # instead lost the evidence, which was the earlier bug. This keeps the
-            # evidence and leaves the flag where it was earned: `corroborated` still
-            # means "this write-up was reported independently", and that is what skips
-            # the jury and what the synthetic verdict speaks for.
-            keeper["corroborated_by"] = (keeper.get("corroborated_by", [])
-                                         + extra.get("corroborated_by", []))
-            dropped.add(extra["id"])
-        # Deliberately not `corroborated`: one model decided these describe the same
-        # defect. That is a claim for the arbiter to weigh, not the independent
-        # agreement that earns a finding a pass on the jury.
-        keeper["merged_semantically"] = True
-    return [f for f in deduped if f["id"] not in dropped]
+        union = {m["id"] for m in members}
+        overlapping = [c for c in clusters if c & union]
+        for existing in overlapping:
+            union |= existing
+        authors = [src for i in sorted(union) for src in by_id[i]["sources"]]
+        if len(set(authors)) != len(authors):
+            continue
+        for existing in overlapping:
+            clusters.remove(existing)
+        clusters.append(union)
+    for index, ids in enumerate(sorted(clusters, key=sorted), 1):
+        for i in sorted(ids):
+            by_id[i]["cluster"] = "c%d" % index
+    return deduped
 
 
 def _jury_targets(deduped, key):
     """The findings `key` is allowed to judge: contested, and none of them its own.
 
-    `sources != [key]` was not that test. A finding the semantic merge grouped carries
-    two names, so it matched neither author's one-name list and went back to BOTH of
-    them to rule on -- with `JUDGE_FIELDS` stripping the id prefix and `sources`, and
-    the prompt telling each judge "None of them are yours". Only reachable since
-    corroboration was frozen in `_dedup`: a merged finding used to skip round 2 outright.
+    `sources != [key]` was not that test: it passed a finding back to its own author
+    whenever two names were on it, with `JUDGE_FIELDS` stripping the id prefix and
+    `sources` and the prompt telling each judge "None of them are yours". `sources` only
+    grows past one name in `_dedup` now, where two harnesses really did file at that
+    line, so the only findings this excludes are ones the judge had a hand in.
     """
     return [f for f in deduped if not f["corroborated"] and key not in f["sources"]]
+
+
+def _resume_plan(pinned, diff_exists, meta_exists, worktree_head):
+    """What stage 0 has to do: (is this run's own material here, the commit to review).
+
+    A head in the snapshot with the diff and metadata beside it means this run got
+    through setup already -- it is being resumed, and it keeps what it pinned, because
+    re-reading would put new code under findings already made against the old. Anything
+    else is a first execution, which reads the PR as it is now.
+
+    The second value is whether the checkout is already the one to review. A resume
+    demands the commit it pinned: another review of this PR may have left the worktree
+    elsewhere, and a review of a sibling PR may have pruned it. A first execution never
+    accepts what it finds -- an agent with fs_write may have written into the last
+    review's copy, and a review starts from the commit its diff describes.
+
+    Inline, this was the region a whole review round could not reach: every predicate
+    around it had been extracted and tested, and this one decided whether to re-read.
+    """
+    mine = bool(pinned.get("head")) and diff_exists and meta_exists
+    return mine, bool(mine and worktree_head and worktree_head == pinned["head"])
 
 
 def _worktrees_to_drop(entries, own, has_report, take_lock):
@@ -506,8 +489,12 @@ def _has_report(directory):
     root = os.path.join(WORKSPACE, ".cao-review", SLUG, directory)
     if not os.path.isdir(root):
         return False
-    return any(os.path.exists(os.path.join(root, run, "final-review.md"))
-               for run in sorted(os.listdir(root)))
+    # The flat path is where reviews landed before artifacts were keyed by run. Volumes
+    # carry both, and a PR reviewed under the old layout is just as finished -- reading
+    # only the new one would keep its checkout on disk for good.
+    return (os.path.exists(os.path.join(root, "final-review.md"))
+            or any(os.path.exists(os.path.join(root, run, "final-review.md"))
+                   for run in sorted(os.listdir(root))))
 
 
 def _prune_finished_worktrees():
@@ -554,17 +541,10 @@ except (OSError, ValueError):
 # A head in the snapshot with the diff and metadata beside it means this run got through
 # setup already: it is being resumed, and it keeps what it pinned. Anything else is a
 # first execution, which reads the PR as it is now.
-_mine = bool(_pinned.get("head")) and os.path.exists(DIFF) and os.path.exists(META)
+_wt_head = (_git("rev-parse", "HEAD", cwd=WT).stdout.strip()
+            if os.path.exists(os.path.join(WT, ".git")) else "")
+_mine, _at_head = _resume_plan(_pinned, os.path.exists(DIFF), os.path.exists(META), _wt_head)
 HEAD_OID = _pinned["head"] if _mine else _head_oid()
-
-# The worktree is the one thing still shared per PR: another review of this PR may have
-# left it at a different commit, and a review of a sibling PR may have pruned it. A
-# resume therefore rebuilds it at the commit it pinned rather than giving up or, as it
-# used to, treating its own artifacts as someone else's and deleting them. A first
-# execution rebuilds it unconditionally -- an agent with fs_write may have written into
-# the last review's checkout, and a review starts from the commit its diff describes.
-_at_head = (_mine and os.path.exists(os.path.join(WT, ".git"))
-            and _git("rev-parse", "HEAD", cwd=WT).stdout.strip() == HEAD_OID)
 
 if not _at_head:
     os.makedirs(os.path.dirname(BARE), exist_ok=True)
@@ -764,7 +744,7 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
         if _groups is None:
             failures["merge-semantic"] = "no usable merge file at %s" % merges_out
         else:
-            deduped = _apply_merges(deduped, _groups)
+            deduped = _mark_clusters(deduped, _groups)
     except ShimHTTPError as exc:
         if getattr(exc, "status", None) == 409:
             raise
@@ -776,14 +756,10 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
 # more harnesses IS the cross-confirmation round 2 exists to produce, so such a finding
 # is confirmed there and skips validation. Two of three agreeing is stronger evidence
 # than two of two was -- the finding had a real chance to go uncorroborated and did not.
-# The semantic merge above unions `sources` too, and that is a different thing: one
-# model's opinion that two write-ups are the same defect. It sets `merged_semantically`
-# and never sets this flag. It can still cost a finding its jury, though, and quietly:
-# a group spanning all three harnesses leaves every one of them an author, so
-# `_jury_targets` finds nobody eligible and the finding reaches the arbiter `unjudged`.
-# That is a real state, not an error -- what it must not be is silent, so it is counted
-# in the output and explained in the arbiter prompt, with the folded write-ups attached
-# for the one reader still able to weigh them.
+# The semantic merge above is a different thing and never sets this flag: one model's
+# opinion that two write-ups describe the same defect. It labels them with a shared
+# `cluster` and changes nothing else -- both keep their author, both are judged, and the
+# arbiter decides whether to report them as one.
 for f in deduped:
     f["sources"] = sorted(f["sources"])
 open(MERGED, "w").write(json.dumps(deduped, indent=2))
@@ -949,17 +925,14 @@ ARBITER_PROMPT = (
     "The adjudicated findings are in the JSON array at %s. Each has `sources` (which "
     "harnesses reported it), `corroborated` (true when two or more reported it "
     "independently, at the same line, in round 1 -- agreement on the PLACE, so check "
-    "`merged_from` before treating it as agreement on the claim), `corroborated_by` "
-    "(which write-ups in the group earned that, which is not always the one whose text "
-    "you are reading), `merged_semantically` (true when a "
-    "merge step judged separate write-ups to be one defect -- one model's opinion, not "
-    "independent agreement, with the other write-ups kept under `merged_from`), "
+    "`merged_from`, which holds what the other reviewer wrote there, before treating it "
+    "as agreement on the claim), `cluster` (a label shared by findings a merge step "
+    "judged to describe ONE defect -- one model's opinion, not independent agreement: "
+    "read them together, report them once if you agree, and say so if you do not), "
     "`verdicts` keyed by judging harness, and `ruling` "
-    "summarising them. A `ruling` of `unjudged` means no harness was eligible to judge "
-    "it -- every one of them is among its `sources`, which happens when a merge group "
-    "spanned all three. Nobody has validated that finding: read the code yourself, and "
-    "read `merged_from` to decide whether those write-ups really are one defect before "
-    "you report them as one. Three harnesses "
+    "summarising them. A `ruling` of `unjudged` means nothing judged it, which should "
+    "not happen while a harness is alive: treat it as unvalidated and read the code. "
+    "Three harnesses "
     "ran: Claude, Codex and OpenCode/DeepSeek. The diff is at %s and PR metadata at %s.\n\n"
     "Resolve the material: drop rejected findings unless the rejection is plainly wrong "
     "(say so if you overrule one), rank what survives by real severity rather than by the "
@@ -1004,6 +977,7 @@ emit_output({
     # Nobody was eligible to judge these: every harness is among their sources. Counted
     # because a run that produces one is not the run the pipeline advertises.
     "unjudged": len([f for f in deduped if f["ruling"] == "unjudged"]),
+    "clusters": len({f["cluster"] for f in deduped if f["cluster"]}),
     "failures": failures,
 })
 

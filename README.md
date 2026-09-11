@@ -194,8 +194,9 @@ Run it directly for more control:
 The workflow script lives at `workflows/pr_cross_review.py` and is synced into the
 container on every start, so editing it plus `./cao up` ships a new version.
 
-Its pure half — repo-spec parsing, finding normalisation, the dedup and the merge
-application — has unit tests that need neither the container nor the network:
+Its pure half — repo-spec parsing, finding normalisation, the dedup, the cluster
+labelling and the stage-0 resume decision — has unit tests that need neither the
+container nor the network:
 
 ```sh
 python3 -m unittest discover -s tests

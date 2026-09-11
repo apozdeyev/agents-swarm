@@ -223,7 +223,6 @@ class Dedup(unittest.TestCase):
         out = MOD._dedup([_finding("claude", 1), other])
         self.assertEqual([f["id"] for f in out], ["claude-1"])
         self.assertTrue(out[0]["corroborated"])
-        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
         self.assertEqual([m["title"] for m in out[0]["merged_from"]],
                          ["a different defect at the same line"])
 
@@ -255,123 +254,82 @@ class Dedup(unittest.TestCase):
     def test_one_harness_alone_is_not_corroborated(self):
         out = MOD._dedup([_finding("claude", 1)])
         self.assertFalse(out[0]["corroborated"])
-        self.assertFalse(out[0]["merged_semantically"])
+        self.assertEqual(out[0]["cluster"], "")
 
 
-class ApplyMerges(unittest.TestCase):
-    def test_cross_source_group_folds_without_becoming_corroborated(self):
-        # The merge is one model's opinion that two write-ups are one defect. Counting
-        # it as corroboration would skip the jury on the strength of that opinion.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
-        self.assertEqual([f["id"] for f in out], ["claude-1"])
-        self.assertEqual(out[0]["sources"], ["claude", "codex"])
-        self.assertTrue(out[0]["merged_semantically"])
-        self.assertFalse(out[0]["corroborated"])
-        self.assertEqual(out[0]["independent_sources"], 1)
+class MarkClusters(unittest.TestCase):
+    """Nothing is folded away any more: a merge is a label, and labels lose nothing."""
 
-    def test_same_source_group_is_refused(self):
-        # The prompt forbids it, nothing checked, and the loser vanished from the run:
-        # title, detail and failure scenario gone, only the id kept in merged_ids.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("claude", 2, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "claude-2"]])
-        self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
-        self.assertFalse(out[0]["merged_semantically"])
+    def _three(self):
+        return MOD._dedup([_finding("claude", 1, line=10),
+                           _finding("codex", 1, line=200),
+                           _finding("opencode", 1, line=400)])
 
-    def test_unknown_ids_and_junk_groups_are_ignored(self):
-        deduped = MOD._dedup([_finding("claude", 1)])
-        out = MOD._apply_merges(deduped, [["claude-1", "codex-99"], "claude-1", []])
-        self.assertEqual([f["id"] for f in out], ["claude-1"])
-        self.assertFalse(out[0]["merged_semantically"])
+    def test_a_group_labels_its_members_and_keeps_them_all(self):
+        out = MOD._mark_clusters(self._three(), [["claude-1", "codex-1"]])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1", "opencode-1"])
+        self.assertEqual(out[0]["cluster"], out[1]["cluster"])
+        self.assertTrue(out[0]["cluster"])
+        self.assertEqual(out[2]["cluster"], "")
+        # Both keep their author, so both still have two judges -- which folding cost
+        # them: a grouped finding used to reach the arbiter with no verdict at all.
+        self.assertEqual(len(MOD._jury_targets(out, "opencode")), 2)
+        self.assertEqual([f["id"] for f in MOD._jury_targets(out, "claude")],
+                         ["codex-1", "opencode-1"])
 
-    def test_round_one_corroboration_survives_a_merge(self):
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
-                              _finding("opencode", 1, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "opencode-1"]])
-        self.assertEqual(len(out), 1)
-        self.assertTrue(out[0]["corroborated"])
-        self.assertEqual(out[0]["independent_sources"], 2)
-        self.assertEqual(out[0]["sources"], ["claude", "codex", "opencode"])
+    def test_the_order_of_a_group_changes_nothing(self):
+        forward = MOD._mark_clusters(self._three(), [["claude-1", "codex-1"]])
+        backward = MOD._mark_clusters(self._three(), [["codex-1", "claude-1"]])
+        self.assertEqual([(f["id"], f["cluster"]) for f in forward],
+                         [(f["id"], f["cluster"]) for f in backward])
 
-    def test_a_repeated_id_does_not_delete_the_keeper(self):
-        # A model writing ["claude-1", "claude-1", "codex-1"] put the same object in
-        # `members` twice, so the keeper was also members[1] and the loop dropped its
-        # own id. Both findings then left the run without a word.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "claude-1", "codex-1"]])
-        self.assertEqual([f["id"] for f in out], ["claude-1"])
-        self.assertEqual(out[0]["sources"], ["claude", "codex"])
+    def test_corroboration_is_untouched_by_a_merge(self):
+        # Two harnesses at one line, a third describing it elsewhere. Folding this lost
+        # the corroboration, or handed it to the wrong claim, depending on the round.
+        deduped = MOD._dedup([_finding("claude", 1, line=10), _finding("codex", 1, line=10),
+                              _finding("opencode", 1, line=400)])
+        out = MOD._mark_clusters(deduped, [["opencode-1", "claude-1"]])
+        corroborated = [f for f in out if f["corroborated"]]
+        self.assertEqual([f["id"] for f in corroborated], ["claude-1"])
+        self.assertEqual(corroborated[0]["independent_sources"], 2)
+        self.assertEqual(out[0]["cluster"], out[1]["cluster"])
 
-    def test_a_repeated_id_cannot_stand_in_for_a_second_member(self):
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "claude-1"]])
-        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
-        self.assertFalse(out[0]["merged_semantically"])
+    def test_overlapping_groups_make_one_cluster(self):
+        # ["claude-1","codex-1"] then ["opencode-1","codex-1"]: the model said all three
+        # are one defect. The second group used to collapse to one member and vanish,
+        # leaving the duplicate the merge stage exists to remove.
+        out = MOD._mark_clusters(self._three(), [["claude-1", "codex-1"],
+                                                 ["opencode-1", "codex-1"]])
+        self.assertEqual(len({f["cluster"] for f in out}), 1)
+        self.assertTrue(all(f["cluster"] for f in out))
 
-    def test_same_source_group_is_refused_even_when_one_is_corroborated(self):
-        # `sources` stops being an author list once _dedup has run: claude-1 carries
-        # codex's name too, which used to satisfy a "two distinct sources" union and let
-        # one reviewer's two findings merge -- the exact case the prompt forbids.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
+    def test_a_group_that_would_pair_one_reviewer_with_itself_is_left_out(self):
+        deduped = MOD._dedup([_finding("claude", 1, line=10),
                               _finding("claude", 2, line=200)])
-        self.assertEqual(deduped[0]["sources"], ["claude", "codex"])
-        out = MOD._apply_merges(deduped, [["claude-1", "claude-2"]])
-        self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
+        out = MOD._mark_clusters(deduped, [["claude-1", "claude-2"]])
+        self.assertEqual([f["cluster"] for f in out], ["", ""])
 
-    def test_corroboration_is_carried_as_evidence_not_transferred(self):
-        # `members[0]` is whichever id the merge model wrote first, and nothing fixes
-        # that order. Dropping the flag lost the evidence; copying it onto the keeper
-        # presented the keeper's OWN claim -- the text the arbiter reads -- as the one
-        # two harnesses filed independently. Neither is true: the evidence travels, the
-        # flag stays where it was earned.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
-                              _finding("opencode", 1, line=400)])
-        out = MOD._apply_merges(deduped, [["opencode-1", "claude-1"]])
-        self.assertEqual([f["id"] for f in out], ["opencode-1"])
-        self.assertFalse(out[0]["corroborated"])
-        self.assertEqual(out[0]["independent_sources"], 1)
-        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
-        # Nothing about the corroborated write-up is lost with it.
-        self.assertIn("codex-1", out[0]["merged_ids"])
-        self.assertIn("claude-1", [m["id"] for m in out[0]["merged_from"]])
+    def test_a_union_that_would_do_the_same_is_left_out_too(self):
+        # A==B and B==C is one cluster; A==B and B==A2 would put Claude's two findings
+        # in one, which the merge prompt forbids and the union check catches.
+        deduped = MOD._dedup([_finding("claude", 1, line=10), _finding("codex", 1, line=200),
+                              _finding("claude", 2, line=400)])
+        out = MOD._mark_clusters(deduped, [["claude-1", "codex-1"],
+                                           ["codex-1", "claude-2"]])
+        self.assertEqual([f["cluster"] for f in out[:2]], [out[0]["cluster"]] * 2)
+        self.assertTrue(out[0]["cluster"])
+        self.assertEqual(out[2]["cluster"], "")
 
-    def test_a_keeper_that_earned_corroboration_keeps_it(self):
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
-                              _finding("opencode", 1, line=400)])
-        out = MOD._apply_merges(deduped, [["claude-1", "opencode-1"]])
-        self.assertTrue(out[0]["corroborated"])
-        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
-        self.assertEqual(out[0]["independent_sources"], 2)
+    def test_junk_groups_neither_crash_nor_label(self):
+        out = MOD._mark_clusters(self._three(), [[["claude-1", "codex-1"]],
+                                                 ["claude-1", ["codex-1"]],
+                                                 "claude-1", [], ["claude-1"],
+                                                 ["claude-1", "codex-99"]])
+        self.assertEqual([f["cluster"] for f in out], ["", "", ""])
 
-    def test_a_group_that_is_not_a_list_of_ids_does_not_kill_the_run(self):
-        # One level of nesting too many is ordinary model output, and `dict.fromkeys`
-        # used every element as a key: the TypeError escaped a try that catches only
-        # Shim errors and took the process down after round 1 had been paid for.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        out = MOD._apply_merges(deduped, [[["claude-1", "codex-1"]]])
-        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
-        out = MOD._apply_merges(deduped, [["claude-1", ["codex-1", "codex-2"]]])
-        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
-
-    def test_overlapping_groups_keep_what_the_first_one_folded(self):
-        # [["claude-1","codex-1"],["opencode-1","claude-1"]] is ordinary model output.
-        # Copying seven fields off claude-1 dropped codex-1 entirely -- not in
-        # merged_from, not even an id in merged_ids.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200),
-                              _finding("opencode", 1, line=400)])
-        out = MOD._apply_merges(deduped, [["claude-1", "codex-1"],
-                                          ["opencode-1", "claude-1"]])
-        self.assertEqual([f["id"] for f in out], ["opencode-1"])
-        self.assertEqual(sorted(m["id"] for m in out[0]["merged_from"]),
-                         ["claude-1", "codex-1"])
-        self.assertEqual(sorted(out[0]["merged_ids"]), ["claude-1", "codex-1"])
-
-    def test_merged_findings_are_json_serialisable(self):
-        # merged.json is what the arbiter reads; a field the encoder chokes on would
-        # take the run down after round 2.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        out = MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
-        self.assertIn('"merged_semantically": true', json.dumps(out))
+    def test_clusters_are_json_serialisable(self):
+        out = MOD._mark_clusters(self._three(), [["claude-1", "codex-1"]])
+        self.assertIn('"cluster": "c1"', json.dumps(out))
 
 
 class StageZero(unittest.TestCase):
@@ -379,6 +337,29 @@ class StageZero(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
+
+    def test_a_first_execution_reads_the_pr_and_rebuilds_the_checkout(self):
+        # No snapshot: nothing pinned, so the PR is read as it is now and the worktree is
+        # never accepted as found -- the last review's copy may have been written into.
+        self.assertEqual(MOD._resume_plan({}, False, False, ""), (False, False))
+        self.assertEqual(MOD._resume_plan({}, True, True, "abc"), (False, False))
+
+    def test_a_resume_keeps_its_pin_and_accepts_its_own_checkout(self):
+        pinned = {"run_id": "run-1", "head": "abc"}
+        self.assertEqual(MOD._resume_plan(pinned, True, True, "abc"), (True, True))
+
+    def test_a_resume_whose_checkout_moved_or_went_keeps_its_pin_anyway(self):
+        # This is what used to make a resume look like a fresh run, which is how it came
+        # to delete its own report: the answer is rebuild at the pin, not re-read.
+        pinned = {"run_id": "run-1", "head": "abc"}
+        self.assertEqual(MOD._resume_plan(pinned, True, True, "def"), (True, False))
+        self.assertEqual(MOD._resume_plan(pinned, True, True, ""), (True, False))
+
+    def test_a_snapshot_without_its_diff_is_not_a_resume(self):
+        pinned = {"run_id": "run-1", "head": "abc"}
+        self.assertEqual(MOD._resume_plan(pinned, False, True, "abc"), (False, False))
+        self.assertEqual(MOD._resume_plan({"run_id": "run-1"}, True, True, "abc"),
+                         (False, False))
 
     def test_a_lock_is_held_until_it_is_released(self):
         path = os.path.join(self.dir, "locks", "owner__name.pr-1.lock")
@@ -490,34 +471,16 @@ class ArtifactPaths(unittest.TestCase):
 
 
 class JuryTargets(unittest.TestCase):
-    def test_a_merge_across_all_three_leaves_nobody_to_judge(self):
-        # Not a bug to be silenced: every harness authored part of it, so none can judge
-        # it independently. What the run must not do is call that a jury.
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200),
-                              _finding("opencode", 1, line=400)])
-        merged = MOD._apply_merges(deduped, [["claude-1", "codex-1", "opencode-1"]])
-        self.assertEqual(len(merged), 1)
-        for key in ("claude", "codex", "opencode"):
-            self.assertEqual(MOD._jury_targets(merged, key), [])
-        # Which is why the folded write-ups have to survive: the arbiter is the only
-        # reader left who can ask whether these are one defect.
-        self.assertEqual([m["id"] for m in merged[0]["merged_from"]],
-                         ["codex-1", "opencode-1"])
-        self.assertEqual(merged[0]["merged_from"][0]["title"], "t")
-
-    def _merged(self):
-        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
-        return MOD._apply_merges(deduped, [["claude-1", "codex-1"]])
-
-    def test_a_merged_finding_never_goes_back_to_its_authors(self):
-        # The regression: `sources != [key]` is true for BOTH authors of a two-name
-        # finding, so each was handed its own work to rule on, anonymised, under a
-        # prompt that says "None of them are yours".
-        merged = self._merged()
-        self.assertEqual(MOD._jury_targets(merged, "claude"), [])
-        self.assertEqual(MOD._jury_targets(merged, "codex"), [])
-        self.assertEqual([f["id"] for f in MOD._jury_targets(merged, "opencode")],
-                         ["claude-1"])
+    def test_a_judge_never_receives_a_finding_it_had_a_hand_in(self):
+        # `sources != [key]` passed a two-name finding back to BOTH its authors, stripped
+        # of the id prefix, under a prompt saying "None of them are yours". Only _dedup
+        # puts two names on a finding now and those skip the jury as corroborated, so
+        # this is the belt to that braces -- stated as the rule it is.
+        shared = dict(_finding("claude", 1), sources=["claude", "codex"],
+                      corroborated=False, independent_sources=2)
+        self.assertEqual(MOD._jury_targets([shared], "claude"), [])
+        self.assertEqual(MOD._jury_targets([shared], "codex"), [])
+        self.assertEqual(len(MOD._jury_targets([shared], "opencode")), 1)
 
     def test_a_solo_finding_goes_to_the_other_two(self):
         deduped = MOD._dedup([_finding("claude", 1)])
