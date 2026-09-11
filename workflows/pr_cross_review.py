@@ -13,7 +13,8 @@ an existing working copy is what this replaces -- that copy sits on whatever bra
 was left on, so every file opened for context was the wrong version of itself.
 
 Determinism note: resume re-executes this file top-to-bottom, so every path derives
-from the inputs and nothing here reads the clock or an RNG.
+from the inputs and the run id -- both stable across a resume -- and nothing here reads
+the clock or an RNG.
 """
 import fcntl
 import json
@@ -63,9 +64,20 @@ BARE = os.path.join(WORKSPACE, ".cao-repos", "%s.git" % SLUG)
 WT = os.path.join(WORKSPACE, ".cao-worktrees", SLUG, "pr-%d" % PR)
 # Every agent step runs here. Named REPO because that is what the prompts call it.
 REPO = WT
+# The run this execution belongs to. CAO sets it and keeps it across a resume, so it
+# names one review from end to end. Absent only when the script is run by hand.
+RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "") or "no-run-id"
+
 # Outside the checkout, so a review run never dirties the git tree. Keyed by owner as
-# well as name: two repos of the same name from different owners are different repos.
-ART = os.path.join(WORKSPACE, ".cao-review", SLUG, "pr-%d" % PR)
+# well as name -- two repos of the same name from different owners are different repos
+# -- and by run, which is what stops two reviews of one PR from deleting each other's
+# material. Sharing a directory per PR needed bookkeeping to decide whose files were on
+# disk, and that bookkeeping produced a defect in three consecutive reviews: a resume
+# wiping the run that superseded it, a resume wiping itself after its checkout had been
+# pruned, a refusal that fired on the wrong run. A run that cannot reach another run's
+# files needs none of it. The cost is that artifacts accumulate per run; they are small
+# beside the bare clone, and nothing else here deletes anything either.
+ART = os.path.join(WORKSPACE, ".cao-review", SLUG, "pr-%d" % PR, RUN_ID)
 DIFF = os.path.join(ART, "diff.patch")
 META = os.path.join(ART, "meta.json")
 MERGED = os.path.join(ART, "merged.json")
@@ -389,62 +401,6 @@ def _take_lock(path):
     return handle
 
 
-def _is_resume_of(run_id, pinned, on_disk):
-    """Whether this execution is a resume of the run that left the snapshot on disk.
-
-    All three have to hold. A resume re-executes this file in a new process under the
-    SAME run id, so the id is the seam between the two things stage 0 must do at once:
-    a new run has to notice the PR gained commits and re-read it, a resume has to keep
-    the snapshot it started from. An absent run id -- the script run by hand -- is never
-    a resume: guessing wrong in that direction deletes a run's own output.
-    """
-    return bool(run_id) and on_disk and pinned.get("run_id") == run_id
-
-
-def _superseded_resume(resuming, run_id, pinned):
-    """Whether this is a resume of a run that a later one has already replaced.
-
-    `_artifacts_are_stale` knows only two states -- the run named in the snapshot, and
-    anybody else -- and clears for anybody else. That is right for a NEW run superseding
-    old output and exactly wrong in the other direction: a run resumed after a later one
-    finished would clear the later one's report and round files, for steps that are
-    already recorded completed and will never write again. Both reviews then have
-    nothing, and the one that was paid for is the one destroyed.
-
-    CAO tells the two apart -- it sets CAO_WORKFLOW_RESUME on a resume and the run id
-    stays the same -- so a resume whose snapshot carries someone else's id is the case
-    to refuse rather than the case to clear.
-    """
-    other = pinned.get("run_id")
-    return bool(resuming and run_id and other and other != run_id)
-
-
-def _artifacts_are_stale(run_id, is_resume, provisioned):
-    """Whether round1/ and round2/ hold a PREVIOUS run's results rather than this one's.
-
-    `_review` and `_validate` read their results off the disk because a step can come
-    back `completed` having written nothing -- and a file the last review of this PR
-    left behind satisfies that check just as well, so the failure this pipeline exists
-    to expose is recorded as a successful review of stale findings. True when the
-    checkout was re-read, and equally when a distinct run starts against a head that has
-    not moved. Never on a resume: its steps are already recorded completed and will not
-    write again, so clearing there throws away the run's own paid-for output.
-    """
-    return bool(provisioned or (run_id and not is_resume))
-
-
-def _clear_artifacts(art, files):
-    """Delete a previous run's outputs: the named files, and both round directories."""
-    for path in files:
-        if os.path.exists(path):
-            os.remove(path)
-    for sub in ("round1", "round2"):
-        directory = os.path.join(art, sub)
-        if os.path.isdir(directory):
-            for leftover in sorted(os.listdir(directory)):
-                os.remove(os.path.join(directory, leftover))
-
-
 def _empty_report(pr, delivered, failures):
     """The report for a run that found nothing.
 
@@ -492,11 +448,10 @@ if __name__ != "__main__":
     raise SystemExit(0)
 
 # --- stage 0: check out the PR and fetch its diff ---------------------------------
-# Plain Python, not an agent step. The whole stage is skipped once the diff, the
-# metadata and the worktree are all present. That is what makes resume safe, and it is
-# also what stops a resume from re-pointing the checkout at commits newer than the
-# cached diff describes -- reviewing code that does not match the diff is the failure
-# this stage exists to prevent.
+# Plain Python, not an agent step. The PR is read once per run: a resume finds its own
+# diff and metadata already on disk and keeps them, which is what stops it re-pointing
+# the checkout at commits newer than those describe -- reviewing code that does not
+# match the diff is the failure this stage exists to prevent.
 PR_REF = "refs/cao/pr-%d" % PR
 SLUG_PATH = "%s/%s" % (OWNER, NAME)
 GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -543,9 +498,16 @@ if RUN_LOCK is None:
 
 
 def _has_report(directory):
-    """Whether some review of that PR has already written its report."""
-    return os.path.exists(
-        os.path.join(WORKSPACE, ".cao-review", SLUG, directory, "final-review.md"))
+    """Whether some review of that PR has already written its report.
+
+    Any of them: artifacts live one directory per run now, so this asks whether ANY run
+    of that PR finished, which is what makes its checkout disposable.
+    """
+    root = os.path.join(WORKSPACE, ".cao-review", SLUG, directory)
+    if not os.path.isdir(root):
+        return False
+    return any(os.path.exists(os.path.join(root, run, "final-review.md"))
+               for run in sorted(os.listdir(root)))
 
 
 def _prune_finished_worktrees():
@@ -568,17 +530,11 @@ def _prune_finished_worktrees():
         held.close()
 
 
-# Which commit this run reviews, and which run pinned it. The run id is the seam
-# between the two things stage 0 has to do at once: a NEW run must notice that the PR
-# gained commits since last time and re-read it, while a RESUME must keep the snapshot
-# it started from -- re-reading there would put new code under findings already made
-# against the old, which is the failure this whole stage exists to prevent. The run id
-# is stable across a resume and different for a new run, so it tells the two apart.
+# Which commit this run reviews. Only this run writes here, so the snapshot answers one
+# question: has THIS run already provisioned? If it has -- a resume -- the pin stands
+# and the API is not asked again, because re-reading would put new code under findings
+# already made against the old, which is the failure this whole stage exists to prevent.
 SNAPSHOT = os.path.join(ART, "snapshot.json")
-RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "")
-# Set by CAO only when it re-spawns a run to resume it. The snapshot's run id says
-# WHICH run owns the material on disk; this says whether we are entitled to replace it.
-RESUMING = os.environ.get("CAO_WORKFLOW_RESUME") == "1"
 
 
 def _head_oid():
@@ -595,53 +551,28 @@ try:
 except (OSError, ValueError):
     _pinned = {}
 
-# Before anything is read, cleared or fetched: the alternative to refusing is deleting
-# a finished review's only copy, and this run gets nothing out of it either.
-if _superseded_resume(RESUMING, RUN_ID, _pinned):
-    raise SystemExit(
-        "run %s cannot be resumed: run %s has reviewed %s#%d since, and the report and "
-        "round files on disk are its. Resuming would clear them for steps that are "
-        "already recorded completed and will not write again -- the finished review "
-        "would be lost and this one would still have nothing. Start a new review "
-        "instead." % (RUN_ID, _pinned.get("run_id"), SLUG_PATH, PR))
+# A head in the snapshot with the diff and metadata beside it means this run got through
+# setup already: it is being resumed, and it keeps what it pinned. Anything else is a
+# first execution, which reads the PR as it is now.
+_mine = bool(_pinned.get("head")) and os.path.exists(DIFF) and os.path.exists(META)
+HEAD_OID = _pinned["head"] if _mine else _head_oid()
 
-_on_disk = (os.path.exists(DIFF) and os.path.exists(META)
-            and os.path.exists(os.path.join(WT, ".git"))
-            # And the checkout is at the commit the snapshot claims. File existence said
-            # nothing about the worktree's state, and the only rev-parse in this file was
-            # inside the branch this decides to skip -- so a checkout that had moved on
-            # was cached as matching, and the harnesses read one commit while the diff
-            # described another.
-            and _git("rev-parse", "HEAD", cwd=WT).stdout.strip() == _pinned.get("head", ""))
+# The worktree is the one thing still shared per PR: another review of this PR may have
+# left it at a different commit, and a review of a sibling PR may have pruned it. A
+# resume therefore rebuilds it at the commit it pinned rather than giving up or, as it
+# used to, treating its own artifacts as someone else's and deleting them. A first
+# execution rebuilds it unconditionally -- an agent with fs_write may have written into
+# the last review's checkout, and a review starts from the commit its diff describes.
+_at_head = (_mine and os.path.exists(os.path.join(WT, ".git"))
+            and _git("rev-parse", "HEAD", cwd=WT).stdout.strip() == HEAD_OID)
 
-_is_resume = _is_resume_of(RUN_ID, _pinned, _on_disk)
-
-if _is_resume:
-    # A resume of the run that took this snapshot. Keep it exactly as it was, and do
-    # not ask the API anything -- the answer could have changed since.
-    HEAD_OID = _pinned.get("head", "")
-else:
-    HEAD_OID = _head_oid()
-
-_provisioned = not (_on_disk and _pinned.get("head") == HEAD_OID)
-if _provisioned:
+if not _at_head:
     os.makedirs(os.path.dirname(BARE), exist_ok=True)
     os.makedirs(os.path.dirname(WT), exist_ok=True)
-    # Invalidated before anything is touched, so that failing partway through leaves
-    # nothing trustworthy rather than something wrong. The head-mismatch refusal below
-    # fires after the worktree has been rebuilt at the new commit but before these are
-    # rewritten, and it used to leave a snapshot and a diff describing the old one: had
-    # the PR later been force-pushed back to that commit, the guard above would have
-    # matched, setup would have been skipped, and every reviewer would have read the new
-    # checkout against the old diff. `_pinned` was read into memory above, so this run's
-    # own decisions are unaffected.
-    for _outdated in (SNAPSHOT, DIFF, META):
-        if os.path.exists(_outdated):
-            os.remove(_outdated)
     # One lock per repository, held only across the git mutations. Two reviews of
     # different PRs of the same repo otherwise race on one object store and one set of
     # worktree admin files, which fails intermittently rather than cleanly.
-    with open(os.path.join(WORKSPACE, ".cao-repos", "%s.lock" % SLUG), "w") as _lock:
+    with open(os.path.join(LOCKS, "%s.lock" % SLUG), "w") as _lock:
         fcntl.flock(_lock, fcntl.LOCK_EX)
         if not os.path.isdir(BARE):
             _git_ok("clone", "--bare", "https://github.com/%s.git" % SLUG_PATH, BARE)
@@ -656,11 +587,14 @@ if _provisioned:
             # git declined because the path is not a registered worktree -- a leftover
             # from an interrupted run. The directory is ours alone, so take it out.
             shutil.rmtree(WT)
-        _git_ok("worktree", "add", "--detach", WT, PR_REF, cwd=BARE)
-        # What is actually in the checkout, which is not necessarily what the API named
-        # a moment ago: a push landing between the two puts newer commits here.
-        _checked_out = _git_ok("rev-parse", PR_REF, cwd=BARE).strip()
+        # A resume checks out the sha it pinned; a first execution takes whatever the
+        # fetch just landed, which is not necessarily what the API named a moment ago.
+        _git_ok("worktree", "add", "--detach", WT, HEAD_OID if _mine else PR_REF, cwd=BARE)
+        _checked_out = _git_ok("rev-parse", "HEAD", cwd=WT).strip()
+else:
+    _checked_out = HEAD_OID
 
+if not _mine:
     _diff = subprocess.run(
         ["gh", "pr", "diff", str(PR), "--repo", SLUG_PATH],
         capture_output=True, text=True, check=True,
@@ -682,12 +616,8 @@ if _provisioned:
     open(META, "w").write(_meta)
     open(DIFF, "w").write(_diff)
 
-if _artifacts_are_stale(RUN_ID, _is_resume, _provisioned):
-    _clear_artifacts(ART, (MERGED, FINAL, os.path.join(ART, "dedup-candidates.json"),
-                           os.path.join(ART, "dedup-merges.json")))
-
-# Written even when nothing was re-read, so that a resume of THIS run recognises its own
-# snapshot and leaves it alone.
+# Written last, so that a resume recognises a setup that actually finished. Nothing else
+# reads it, and no other run can.
 open(SNAPSHOT, "w").write(json.dumps({"run_id": RUN_ID, "head": HEAD_OID}, indent=2))
 
 # Outside the setup guard: ~/.claude.json is not on a volume, so a container recreate

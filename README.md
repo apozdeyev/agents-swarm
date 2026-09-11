@@ -150,25 +150,33 @@ so the pipeline owns the git state:
 ```
 ~/workspace/.cao-repos/<owner>__<name>.git        bare clone, one per repository
 ~/workspace/.cao-worktrees/<owner>__<name>/pr-<n> detached at refs/pull/<n>/head
-~/workspace/.cao-review/<owner>__<name>/pr-<n>/   artifacts
+~/workspace/.cao-review/<owner>__<name>/pr-<n>/<run-id>/  artifacts, one run per dir
 ```
 
 `refs/pull/<n>/head` rather than the branch name: it resolves for merged and closed PRs
-and for PRs from forks. Worktrees of *other* PRs of the same repo are removed once their
-review has produced a `final-review.md` **and** no run holds that PR's lock — the report
-alone is not proof the review is over, because a re-review of that PR finds its checkout
-already on disk and skips setup. The artifacts stay. Bare clones are never removed —
-cheap to keep, expensive to rebuild.
+and for PRs from forks. Worktrees of *other* PRs of the same repo are removed once some
+review of that PR has produced a `final-review.md` **and** no run holds its lock — the
+report alone is not proof the review is over, because a resume of that PR takes the
+checkout back. Nothing under `.cao-review` is ever deleted. Bare clones are never
+removed either — cheap to keep, expensive to rebuild.
 
-Concurrent reviews of *different* PRs work: paths are keyed by owner, name and PR
-number, and the git mutations are serialised per repository by a file lock. The same PR
-is a different matter — every path a run writes is keyed by PR alone, so a second review
-of one already in flight would overwrite its material and could pull the checkout out
-from under it. Each run therefore takes a per-PR lock for its whole life, and a second
-attempt exits immediately saying so. The real ceiling is provider rate limits — one run
-already holds three live model sessions.
+**Artifacts are keyed by run**, not just by PR: a resume, a re-review and the run it
+supersedes each own a directory and none of them can reach another's. That is deliberate
+— the earlier layout shared one directory per PR and needed bookkeeping to work out
+whose files were on disk, which went wrong three reviews in a row and each time deleted
+output somebody had paid fifteen minutes and three model sessions for. The cost is that
+artifacts accumulate: one diff and one set of round files per run, small beside the bare
+clone, and nothing prunes them.
 
-Artifacts sit outside the checkout, so a review never dirties the git tree.
+The checkout is the one thing still shared per PR, so each run takes a per-PR lock for
+its whole life and a second review of a PR already in flight exits immediately saying
+so. A resume rebuilds the checkout at the commit it pinned if some other run has moved
+it. Reviews of *different* PRs run concurrently — the git mutations are serialised per
+repository by a file lock. The real ceiling is provider rate limits: one run already
+holds three live model sessions.
+
+Artifacts sit outside the checkout, so a review never dirties the git tree. The run id
+is in the JSON `./cao review` prints, and `final_review` there is the exact path.
 `final-review.md` is the report; `round1/*.json`, `merged.json`, `round2/*.json` and
 `round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
 debugging the pipeline itself.

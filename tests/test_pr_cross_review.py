@@ -20,7 +20,7 @@ SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
                       "workflows", "pr_cross_review.py")
 
 
-def _load(repo="owner/name", pr=1):
+def _load(repo="owner/name", pr=1, run_id="test-run"):
     """Load the workflow module for its helpers. Returns (module, exit code).
 
     Two things stand between the file and an import: it pulls `cao_workflow`, which
@@ -37,6 +37,11 @@ def _load(repo="owner/name", pr=1):
     shim.step = lambda *args, **kwargs: None
     saved = sys.modules.get("cao_workflow")
     sys.modules["cao_workflow"] = shim
+    was = os.environ.get("CAO_WORKFLOW_RUN_ID")
+    if run_id is None:
+        os.environ.pop("CAO_WORKFLOW_RUN_ID", None)
+    else:
+        os.environ["CAO_WORKFLOW_RUN_ID"] = run_id
     try:
         spec = importlib.util.spec_from_file_location("pr_cross_review", SCRIPT)
         module = importlib.util.module_from_spec(spec)
@@ -51,6 +56,10 @@ def _load(repo="owner/name", pr=1):
             sys.modules.pop("cao_workflow", None)
         else:
             sys.modules["cao_workflow"] = saved
+        if was is None:
+            os.environ.pop("CAO_WORKFLOW_RUN_ID", None)
+        else:
+            os.environ["CAO_WORKFLOW_RUN_ID"] = was
 
 
 MOD, _EXIT = _load()
@@ -381,55 +390,6 @@ class StageZero(unittest.TestCase):
         self.assertIsNotNone(second)
         second.close()
 
-    def test_a_resume_is_the_same_run_id_over_material_on_disk(self):
-        pinned = {"run_id": "run-1", "head": "abc"}
-        self.assertTrue(MOD._is_resume_of("run-1", pinned, True))
-        self.assertFalse(MOD._is_resume_of("run-2", pinned, True))
-        self.assertFalse(MOD._is_resume_of("run-1", pinned, False))
-        # No run id at all: the script run by hand, never a resume.
-        self.assertFalse(MOD._is_resume_of("", pinned, True))
-        self.assertFalse(MOD._is_resume_of("run-1", {}, True))
-
-    def test_a_resume_over_a_later_run_is_refused_not_cleared(self):
-        # The clearing predicate knows only "the snapshot's run" and "anybody else", and
-        # clears for anybody else -- right for a new run superseding old output, exactly
-        # wrong for an old run resumed after a later one finished, whose report it would
-        # delete for steps that will never write again.
-        later = {"run_id": "run-2", "head": "abc"}
-        self.assertTrue(MOD._superseded_resume(True, "run-1", later))
-        # A resume of the run that owns the material carries on as before.
-        self.assertFalse(MOD._superseded_resume(True, "run-2", later))
-        # A fresh run over someone else's output still clears: that is a re-review.
-        self.assertFalse(MOD._superseded_resume(False, "run-3", later))
-        # Nothing on disk to lose, and nothing to identify.
-        self.assertFalse(MOD._superseded_resume(True, "run-1", {}))
-        self.assertFalse(MOD._superseded_resume(True, "", later))
-
-    def test_only_a_resume_keeps_the_files_on_disk(self):
-        # Inverting this predicate deletes the output of the run being resumed, whose
-        # steps are recorded completed and will never write again.
-        self.assertFalse(MOD._artifacts_are_stale("run-1", True, False))
-        self.assertTrue(MOD._artifacts_are_stale("run-1", False, False))
-        self.assertTrue(MOD._artifacts_are_stale("run-1", False, True))
-        # Re-provisioned: the diff changed, so nothing on disk describes this code.
-        self.assertTrue(MOD._artifacts_are_stale("", False, True))
-        # Run by hand with no run id and nothing re-read: leave it alone.
-        self.assertFalse(MOD._artifacts_are_stale("", False, False))
-
-    def test_clearing_takes_the_rounds_and_leaves_stage_zero_alone(self):
-        art = self.dir
-        for sub in ("round1", "round2"):
-            os.makedirs(os.path.join(art, sub))
-            open(os.path.join(art, sub, "claude.json"), "w").write("{}")
-        for name in ("merged.json", "final-review.md", "diff.patch", "snapshot.json"):
-            open(os.path.join(art, name), "w").write("x")
-        MOD._clear_artifacts(art, (os.path.join(art, "merged.json"),
-                                   os.path.join(art, "final-review.md"),
-                                   os.path.join(art, "nope.json")))
-        self.assertEqual(sorted(os.listdir(art)),
-                         ["diff.patch", "round1", "round2", "snapshot.json"])
-        self.assertEqual(os.listdir(os.path.join(art, "round1")), [])
-
     def test_the_empty_report_names_who_delivered_and_who_did_not(self):
         text = MOD._empty_report(7, ["claude"], {"codex": "no usable findings file"})
         self.assertIn("# PR #7 cross-review", text)
@@ -505,6 +465,28 @@ class StageZero(unittest.TestCase):
         self.assertIn("PR #2 moved", message)
         self.assertIn("a" * 12, message)
         self.assertIn("b" * 12, message)
+
+
+class ArtifactPaths(unittest.TestCase):
+    """One directory per run is what replaced the bookkeeping that kept losing output."""
+
+    def test_two_runs_of_one_pr_share_no_artifact_path(self):
+        a, _ = _load(pr=7, run_id="run-A")
+        b, _ = _load(pr=7, run_id="run-B")
+        for path in ("ART", "DIFF", "META", "MERGED", "FINAL"):
+            self.assertNotEqual(getattr(a, path), getattr(b, path), path)
+        # Same PR, so the checkout is still shared -- the per-PR lock covers that.
+        self.assertEqual(a.WT, b.WT)
+        self.assertTrue(a.ART.endswith("/pr-7/run-A"))
+
+    def test_a_resume_lands_on_its_own_directory(self):
+        first, _ = _load(pr=7, run_id="run-A")
+        resumed, _ = _load(pr=7, run_id="run-A")
+        self.assertEqual(first.ART, resumed.ART)
+
+    def test_running_the_script_by_hand_still_has_a_home(self):
+        module, _ = _load(pr=7, run_id=None)
+        self.assertTrue(module.ART.endswith("/pr-7/no-run-id"))
 
 
 class JuryTargets(unittest.TestCase):
