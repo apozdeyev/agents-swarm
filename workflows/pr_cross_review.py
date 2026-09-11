@@ -199,6 +199,15 @@ def _dedup(findings):
                     if src not in kept["sources"]:
                         kept["sources"].append(src)
                 kept["merged_ids"] = kept.get("merged_ids", []) + [finding["id"]]
+                # And its words, not just its id. Same file, same line, same category is
+                # where two harnesses agree; whether they are describing one defect is a
+                # judgement no arithmetic makes -- and this collapse is what skips round
+                # 2, so nothing downstream ever checked it. `_apply_merges` keeps folded
+                # write-ups for exactly that reason; this path dropped them, leaving the
+                # arbiter a corroboration it had no way to verify.
+                kept["merged_from"] = kept.get("merged_from", []) + [
+                    {k: finding[k] for k in ("id", "sources", "file", "line",
+                                             "title", "detail", "failure_scenario")}]
                 break
         else:
             deduped.append(finding)
@@ -208,6 +217,11 @@ def _dedup(findings):
         # on their own -- same defect, same line, no model in between -- may do that.
         finding["independent_sources"] = len(finding["sources"])
         finding["corroborated"] = finding["independent_sources"] > 1
+        # Which write-ups earned corroboration, not just that someone in the cluster
+        # did. A merge below folds findings together, and the flag has to stay attached
+        # to the claim two harnesses actually filed rather than travelling to whichever
+        # one the merge model listed first.
+        finding["corroborated_by"] = [finding["id"]] if finding["corroborated"] else []
         finding["merged_semantically"] = False
     return deduped
 
@@ -230,7 +244,14 @@ def _apply_merges(deduped, groups):
         # keeper was also members[1] and the loop dropped its own id: both findings then
         # vanished from the run, silently, with `len(members) >= 2` satisfied by the
         # repetition alone.
-        members = [by_id[i] for i in dict.fromkeys(group) if i in by_id and i not in dropped]
+        # Only string ids: `dict.fromkeys` uses each element as a key, so one level of
+        # nesting too many -- {"merges": [[["a","b"]]]}, ordinary enough model output --
+        # raised `TypeError: unhashable type: 'list'`, and the try around the call site
+        # catches Shim errors only, so it killed the process after round 1 had been paid
+        # for. `_read_items` checks the container; this is the same check one level in,
+        # which `_load_round1` and `_validate` already do for their elements.
+        ids = dict.fromkeys(i for i in group if isinstance(i, str))
+        members = [by_id[i] for i in ids if i in by_id and i not in dropped]
         # Every member must bring authors none of the others has. A union of two was not
         # that test: `sources` stops being an author list once `_dedup` has run -- a
         # finding two harnesses filed at the same line carries both names -- so a group
@@ -263,14 +284,18 @@ def _apply_merges(deduped, groups):
                                          ("id", "sources", "file", "line",
                                           "title", "detail", "failure_scenario")}]
                                      + extra.get("merged_from", []))
+            # Carried, not transferred. `members[0]` is whichever id the merge model
+            # wrote first and nothing fixes that order, so copying the flag onto the
+            # keeper presented ITS claim -- the text that reaches the arbiter and the
+            # report -- as the one two harnesses had filed independently, when what they
+            # filed is a different write-up now folded underneath. Dropping the flag
+            # instead lost the evidence, which was the earlier bug. This keeps the
+            # evidence and leaves the flag where it was earned: `corroborated` still
+            # means "this write-up was reported independently", and that is what skips
+            # the jury and what the synthetic verdict speaks for.
+            keeper["corroborated_by"] = (keeper.get("corroborated_by", [])
+                                         + extra.get("corroborated_by", []))
             dropped.add(extra["id"])
-        # Folded, not inherited. `members[0]` is whichever id the merge model happened
-        # to write first, and nothing in the prompt fixes that order -- so a finding two
-        # harnesses had reported independently at the same line lost its corroboration
-        # by being listed second, arriving at the arbiter neither corroborated nor,
-        # since its sources now spanned every harness, judged by anyone.
-        keeper["corroborated"] = any(m["corroborated"] for m in members)
-        keeper["independent_sources"] = max(m["independent_sources"] for m in members)
         # Deliberately not `corroborated`: one model decided these describe the same
         # defect. That is a claim for the arbiter to weigh, not the independent
         # agreement that earns a finding a pass on the jury.
@@ -550,7 +575,13 @@ except (OSError, ValueError):
     _pinned = {}
 
 _on_disk = (os.path.exists(DIFF) and os.path.exists(META)
-            and os.path.exists(os.path.join(WT, ".git")))
+            and os.path.exists(os.path.join(WT, ".git"))
+            # And the checkout is at the commit the snapshot claims. File existence said
+            # nothing about the worktree's state, and the only rev-parse in this file was
+            # inside the branch this decides to skip -- so a checkout that had moved on
+            # was cached as matching, and the harnesses read one commit while the diff
+            # described another.
+            and _git("rev-parse", "HEAD", cwd=WT).stdout.strip() == _pinned.get("head", ""))
 
 _is_resume = _is_resume_of(RUN_ID, _pinned, _on_disk)
 
@@ -565,6 +596,17 @@ _provisioned = not (_on_disk and _pinned.get("head") == HEAD_OID)
 if _provisioned:
     os.makedirs(os.path.dirname(BARE), exist_ok=True)
     os.makedirs(os.path.dirname(WT), exist_ok=True)
+    # Invalidated before anything is touched, so that failing partway through leaves
+    # nothing trustworthy rather than something wrong. The head-mismatch refusal below
+    # fires after the worktree has been rebuilt at the new commit but before these are
+    # rewritten, and it used to leave a snapshot and a diff describing the old one: had
+    # the PR later been force-pushed back to that commit, the guard above would have
+    # matched, setup would have been skipped, and every reviewer would have read the new
+    # checkout against the old diff. `_pinned` was read into memory above, so this run's
+    # own decisions are unaffected.
+    for _outdated in (SNAPSHOT, DIFF, META):
+        if os.path.exists(_outdated):
+            os.remove(_outdated)
     # One lock per repository, held only across the git mutations. Two reviews of
     # different PRs of the same repo otherwise race on one object store and one set of
     # worktree admin files, which fails intermittently rather than cleanly.
@@ -916,8 +958,16 @@ for finding in deduped:
             # `independent_sources`, not len(sources): the semantic merge adds names to
             # that list, and a claim it grouped is not something the harnesses reported
             # independently. Saying so would manufacture the corroboration.
-            "reasoning": "Reported independently by %d of %d harnesses in round 1." % (
-                finding["independent_sources"], len(HARNESSES)),
+            #
+            # And it states what was observed rather than asserting the conclusion: what
+            # %d harnesses agreed on is the place. Whether their write-ups describe one
+            # defect is the judgement this verdict used to make on their behalf, and
+            # nothing downstream could check it -- so the write-ups travel with it now.
+            "reasoning": "%d of %d harnesses independently reported a defect at this "
+                         "file and line in round 1, which is why it skipped the jury. "
+                         "Their other write-ups are under `merged_from` -- read them and "
+                         "confirm they describe the same defect before reporting it as "
+                         "one." % (finding["independent_sources"], len(HARNESSES)),
             "corrected_severity": finding["severity"],
         }
     # With two judges per contested finding the jury can disagree, and that disagreement
@@ -937,7 +987,10 @@ ARBITER_PROMPT = (
     "Write the final review for pull request #%d of the repository at %s.\n\n"
     "The adjudicated findings are in the JSON array at %s. Each has `sources` (which "
     "harnesses reported it), `corroborated` (true when two or more reported it "
-    "independently, at the same line, in round 1), `merged_semantically` (true when a "
+    "independently, at the same line, in round 1 -- agreement on the PLACE, so check "
+    "`merged_from` before treating it as agreement on the claim), `corroborated_by` "
+    "(which write-ups in the group earned that, which is not always the one whose text "
+    "you are reading), `merged_semantically` (true when a "
     "merge step judged separate write-ups to be one defect -- one model's opinion, not "
     "independent agreement, with the other write-ups kept under `merged_from`), "
     "`verdicts` keyed by judging harness, and `ruling` "
@@ -950,8 +1003,10 @@ ARBITER_PROMPT = (
     "Resolve the material: drop rejected findings unless the rejection is plainly wrong "
     "(say so if you overrule one), rank what survives by real severity rather than by the "
     "label it carries, and lead with anything that would break in production. Corroborated "
-    "findings are the strongest signal in the set -- two or more models found them "
-    "independently. A `ruling` of `split` means the two judges disagreed: do not average "
+    "findings are the strongest signal in the set -- two or more models found a defect at "
+    "that line independently -- but they skipped the jury, so you are the only reader who "
+    "checks that the write-ups under `merged_from` are really one defect; say so if they "
+    "are not. A `ruling` of `split` means the two judges disagreed: do not average "
     "them, read the code and say which judge is right and why. Findings marked "
     "needs-context belong in a separate short section, not the main list.\n\n"
     "Write Markdown to %s: a two-sentence verdict on the PR, then the findings as sections "

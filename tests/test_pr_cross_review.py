@@ -205,6 +205,19 @@ class Dedup(unittest.TestCase):
         self.assertTrue(out[0]["corroborated"])
         self.assertEqual(out[0]["merged_ids"], ["codex-1"])
 
+    def test_a_collapse_keeps_the_write_up_it_folds(self):
+        # Same file, same line, same category is where two harnesses agree; whether they
+        # describe one defect is a judgement. This collapse skips round 2, so the loser's
+        # words are the only way anyone downstream can check it -- and they were dropped.
+        other = _finding("codex", 1)
+        other["title"] = "a different defect at the same line"
+        out = MOD._dedup([_finding("claude", 1), other])
+        self.assertEqual([f["id"] for f in out], ["claude-1"])
+        self.assertTrue(out[0]["corroborated"])
+        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
+        self.assertEqual([m["title"] for m in out[0]["merged_from"]],
+                         ["a different defect at the same line"])
+
     def test_nearby_lines_are_different_findings(self):
         # A missing bounds check at :100 and a wrong return value at :102 are two bugs.
         # Proximity used to collapse them and mark the survivor corroborated, which
@@ -296,19 +309,40 @@ class ApplyMerges(unittest.TestCase):
         out = MOD._apply_merges(deduped, [["claude-1", "claude-2"]])
         self.assertEqual([f["id"] for f in out], ["claude-1", "claude-2"])
 
-    def test_corroboration_survives_being_listed_second(self):
+    def test_corroboration_is_carried_as_evidence_not_transferred(self):
         # `members[0]` is whichever id the merge model wrote first, and nothing fixes
-        # that order. Inheriting the keeper's flags cost a finding two harnesses had
-        # found independently both its corroboration and, since its sources then spanned
-        # every harness, any judge at all.
+        # that order. Dropping the flag lost the evidence; copying it onto the keeper
+        # presented the keeper's OWN claim -- the text the arbiter reads -- as the one
+        # two harnesses filed independently. Neither is true: the evidence travels, the
+        # flag stays where it was earned.
         deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
                               _finding("opencode", 1, line=400)])
         out = MOD._apply_merges(deduped, [["opencode-1", "claude-1"]])
         self.assertEqual([f["id"] for f in out], ["opencode-1"])
-        self.assertTrue(out[0]["corroborated"])
-        self.assertEqual(out[0]["independent_sources"], 2)
-        # The corroborated member's own history comes with it.
+        self.assertFalse(out[0]["corroborated"])
+        self.assertEqual(out[0]["independent_sources"], 1)
+        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
+        # Nothing about the corroborated write-up is lost with it.
         self.assertIn("codex-1", out[0]["merged_ids"])
+        self.assertIn("claude-1", [m["id"] for m in out[0]["merged_from"]])
+
+    def test_a_keeper_that_earned_corroboration_keeps_it(self):
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1),
+                              _finding("opencode", 1, line=400)])
+        out = MOD._apply_merges(deduped, [["claude-1", "opencode-1"]])
+        self.assertTrue(out[0]["corroborated"])
+        self.assertEqual(out[0]["corroborated_by"], ["claude-1"])
+        self.assertEqual(out[0]["independent_sources"], 2)
+
+    def test_a_group_that_is_not_a_list_of_ids_does_not_kill_the_run(self):
+        # One level of nesting too many is ordinary model output, and `dict.fromkeys`
+        # used every element as a key: the TypeError escaped a try that catches only
+        # Shim errors and took the process down after round 1 had been paid for.
+        deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1, line=200)])
+        out = MOD._apply_merges(deduped, [[["claude-1", "codex-1"]]])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
+        out = MOD._apply_merges(deduped, [["claude-1", ["codex-1", "codex-2"]]])
+        self.assertEqual([f["id"] for f in out], ["claude-1", "codex-1"])
 
     def test_overlapping_groups_keep_what_the_first_one_folded(self):
         # [["claude-1","codex-1"],["opencode-1","claude-1"]] is ordinary model output.
