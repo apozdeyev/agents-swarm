@@ -401,6 +401,24 @@ def _is_resume_of(run_id, pinned, on_disk):
     return bool(run_id) and on_disk and pinned.get("run_id") == run_id
 
 
+def _superseded_resume(resuming, run_id, pinned):
+    """Whether this is a resume of a run that a later one has already replaced.
+
+    `_artifacts_are_stale` knows only two states -- the run named in the snapshot, and
+    anybody else -- and clears for anybody else. That is right for a NEW run superseding
+    old output and exactly wrong in the other direction: a run resumed after a later one
+    finished would clear the later one's report and round files, for steps that are
+    already recorded completed and will never write again. Both reviews then have
+    nothing, and the one that was paid for is the one destroyed.
+
+    CAO tells the two apart -- it sets CAO_WORKFLOW_RESUME on a resume and the run id
+    stays the same -- so a resume whose snapshot carries someone else's id is the case
+    to refuse rather than the case to clear.
+    """
+    other = pinned.get("run_id")
+    return bool(resuming and run_id and other and other != run_id)
+
+
 def _artifacts_are_stale(run_id, is_resume, provisioned):
     """Whether round1/ and round2/ hold a PREVIOUS run's results rather than this one's.
 
@@ -558,6 +576,9 @@ def _prune_finished_worktrees():
 # is stable across a resume and different for a new run, so it tells the two apart.
 SNAPSHOT = os.path.join(ART, "snapshot.json")
 RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "")
+# Set by CAO only when it re-spawns a run to resume it. The snapshot's run id says
+# WHICH run owns the material on disk; this says whether we are entitled to replace it.
+RESUMING = os.environ.get("CAO_WORKFLOW_RESUME") == "1"
 
 
 def _head_oid():
@@ -573,6 +594,16 @@ try:
     _pinned = json.load(open(SNAPSHOT))
 except (OSError, ValueError):
     _pinned = {}
+
+# Before anything is read, cleared or fetched: the alternative to refusing is deleting
+# a finished review's only copy, and this run gets nothing out of it either.
+if _superseded_resume(RESUMING, RUN_ID, _pinned):
+    raise SystemExit(
+        "run %s cannot be resumed: run %s has reviewed %s#%d since, and the report and "
+        "round files on disk are its. Resuming would clear them for steps that are "
+        "already recorded completed and will not write again -- the finished review "
+        "would be lost and this one would still have nothing. Start a new review "
+        "instead." % (RUN_ID, _pinned.get("run_id"), SLUG_PATH, PR))
 
 _on_disk = (os.path.exists(DIFF) and os.path.exists(META)
             and os.path.exists(os.path.join(WT, ".git"))

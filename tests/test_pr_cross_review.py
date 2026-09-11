@@ -390,6 +390,21 @@ class StageZero(unittest.TestCase):
         self.assertFalse(MOD._is_resume_of("", pinned, True))
         self.assertFalse(MOD._is_resume_of("run-1", {}, True))
 
+    def test_a_resume_over_a_later_run_is_refused_not_cleared(self):
+        # The clearing predicate knows only "the snapshot's run" and "anybody else", and
+        # clears for anybody else -- right for a new run superseding old output, exactly
+        # wrong for an old run resumed after a later one finished, whose report it would
+        # delete for steps that will never write again.
+        later = {"run_id": "run-2", "head": "abc"}
+        self.assertTrue(MOD._superseded_resume(True, "run-1", later))
+        # A resume of the run that owns the material carries on as before.
+        self.assertFalse(MOD._superseded_resume(True, "run-2", later))
+        # A fresh run over someone else's output still clears: that is a re-review.
+        self.assertFalse(MOD._superseded_resume(False, "run-3", later))
+        # Nothing on disk to lose, and nothing to identify.
+        self.assertFalse(MOD._superseded_resume(True, "run-1", {}))
+        self.assertFalse(MOD._superseded_resume(True, "", later))
+
     def test_only_a_resume_keeps_the_files_on_disk(self):
         # Inverting this predicate deletes the output of the run being resumed, whose
         # steps are recorded completed and will never write again.
