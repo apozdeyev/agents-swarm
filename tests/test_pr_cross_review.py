@@ -7,6 +7,7 @@ plain data. That is the half of the workflow where a mistake is invisible -- a w
 path or a wrongly merged finding does not raise, it produces a confident review of the
 wrong thing after fifteen minutes and three live model sessions.
 """
+import ast
 import importlib.util
 import json
 import os
@@ -415,6 +416,12 @@ class StageZero(unittest.TestCase):
         note = MOD._exit_note(1, os.path.join(self.dir, "nope.md"), {"arbiter": "silent"})
         self.assertIn("arbiter", note)
         self.assertNotIn("final review:", note)
+        # None means this execution published none. The file can still be there, left by
+        # an earlier execution over different input, and that is not this run's answer.
+        note = MOD._exit_note(1, None, {"arbiter": "silent"})
+        self.assertIn("arbiter", note)
+        self.assertNotIn("final review:", note)
+        self.assertNotIn("final review:", note)
 
     def test_a_held_lock_keeps_a_siblings_checkout(self):
         # Inverting this is the one regression that destroys work in progress: the
@@ -492,6 +499,388 @@ class JuryTargets(unittest.TestCase):
         deduped = MOD._dedup([_finding("claude", 1), _finding("codex", 1)])
         for key in ("claude", "codex", "opencode"):
             self.assertEqual(MOD._jury_targets(deduped, key), [])
+
+
+class SecondAttempt(unittest.TestCase):
+    """`_twice`: what makes a step worth running again, and what does not.
+
+    It exists because a step can come back `completed` having written nothing -- CAO ends
+    one on a single reading of COMPLETED, and a model thinking between tool calls looks
+    exactly like a pane that has gone quiet. These pin the parts that would fail silently
+    if they drifted: exactly two attempts and no more, an honest empty answer is not one
+    of them, the retry's id carries the generation so a resume can repair the case this
+    exists for, and the mark names the step rather than the attempt.
+    """
+
+    def _harness(self, writes_on=(), errors=None):
+        """A `run`/`load` pair over a fake disk, plus the call and mark logs.
+
+        `run` writes a finding for any step id in `writes_on` and returns the error text
+        in `errors` for any id that has one, exactly as `_step_or_error` would.
+        """
+        disk, calls, marked = [], [], []
+        errors = errors or {}
+
+        def run(step_id):
+            calls.append(step_id)
+            if step_id in errors:
+                return errors[step_id]
+            if step_id in writes_on:
+                disk.append(["a finding"])
+            return None
+
+        return run, (lambda: disk[-1] if disk else None), calls, marked
+
+    def test_a_step_that_delivered_is_not_run_again(self):
+        run, load, calls, marked = self._harness(writes_on={"r1-codex"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (["a finding"], None))
+        self.assertEqual(calls, ["r1-codex"])
+        self.assertEqual(marked, [])
+
+    def test_a_silent_step_is_run_once_more_and_the_retry_carries_the_generation(self):
+        run, load, calls, marked = self._harness(writes_on={"r1-codex-retry-7"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (["a finding"], None))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        # The mark names the step, not the attempt: what matters is that it needed one.
+        self.assertEqual(marked, ["r1-codex"])
+
+    def test_a_resume_gets_a_fresh_retry_id(self):
+        """A fixed one would be replayed from the journal, so no agent would run."""
+        first = self._harness()
+        MOD._twice(first[0], first[1], "r1-codex", "1", first[3].append)
+        later = self._harness()
+        MOD._twice(later[0], later[1], "r1-codex", "2", later[3].append)
+        self.assertEqual(first[2][1], "r1-codex-retry-1")
+        self.assertEqual(later[2][1], "r1-codex-retry-2")
+
+    def test_two_silent_attempts_are_all_it_gets(self):
+        run, load, calls, marked = self._harness()
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, None))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        self.assertEqual(marked, ["r1-codex"])
+
+    def test_an_empty_answer_is_an_answer(self):
+        """Round 1 delivers [] for "found nothing"; round 2 hands _twice None instead."""
+        for empty in ([], {}, ""):
+            with self.subTest(empty=empty):
+                calls, marked = [], []
+                value, err = MOD._twice(lambda step_id: calls.append(step_id),
+                                        lambda: empty, "r1-codex", "7", marked.append)
+                self.assertEqual((value, err), (empty, None))
+                self.assertEqual(calls, ["r1-codex"])
+                self.assertEqual(marked, [])
+
+    def test_a_first_attempt_that_failed_is_not_retried(self):
+        """A step that raised is a different thing from a step that stayed silent."""
+        run, load, calls, marked = self._harness(errors={"r1-codex": "boom"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, "boom"))
+        self.assertEqual(calls, ["r1-codex"])
+        self.assertEqual(marked, [])
+
+    def test_a_retry_that_failed_surfaces_its_error(self):
+        run, load, calls, marked = self._harness(errors={"r1-codex-retry-7": "boom"})
+        value, err = MOD._twice(run, load, "r1-codex", "7", marked.append)
+        self.assertEqual((value, err), (None, "boom"))
+        self.assertEqual(calls, ["r1-codex", "r1-codex-retry-7"])
+        self.assertEqual(marked, ["r1-codex"])
+
+
+class StepIdentity(unittest.TestCase):
+    """`_digest`: a step whose input changed has to be a different step.
+
+    Round 2's anonymous ids are positional, so `f-01` names a different finding as soon
+    as a judge's target list changes -- which a resume can now do, because a round-1
+    retry really executes there. CAO replays a completed step whose call fingerprint
+    matches and halts loudly on one that does not, so the id has to move with the input.
+    """
+
+    def test_the_same_payload_names_the_same_step(self):
+        payload = [{"id": "f-01", "file": "a.py", "line": 10}]
+        self.assertEqual(MOD._digest(payload), MOD._digest(list(payload)))
+
+    def test_key_order_is_not_a_change(self):
+        self.assertEqual(MOD._digest([{"a": 1, "b": 2}]), MOD._digest([{"b": 2, "a": 1}]))
+
+    def test_a_judge_whose_targets_moved_gets_a_new_id(self):
+        """The defect this closes: same id, new numbering, old verdicts read anyway."""
+        before = MOD._dedup([_finding("claude", 1)])
+        after = MOD._dedup([_finding("claude", 1), _finding("codex", 2, file="b.py")])
+        first, _ = MOD._anonymize(MOD._jury_targets(before, "opencode"))
+        later, _ = MOD._anonymize(MOD._jury_targets(after, "opencode"))
+        self.assertNotEqual(MOD._digest(first), MOD._digest(later))
+
+    def test_an_untouched_judge_keeps_its_id_so_its_verdicts_still_replay(self):
+        first, _ = MOD._anonymize(MOD._jury_targets(MOD._dedup([_finding("claude", 1)]),
+                                                    "opencode"))
+        again, _ = MOD._anonymize(MOD._jury_targets(MOD._dedup([_finding("claude", 1)]),
+                                                    "opencode"))
+        self.assertEqual(MOD._digest(first), MOD._digest(again))
+
+    def test_a_judges_files_and_its_step_id_move_together(self):
+        """Either alone is a bug: renaming only the files under a fixed id is DIVERGED."""
+        payload = [{"id": "f-01", "file": "a.py"}]
+        moved = [{"id": "f-01", "file": "b.py"}]
+        before = MOD._jury_artifacts("/art", "claude", payload)
+        unchanged = MOD._jury_artifacts("/art", "claude", list(payload))
+        after = MOD._jury_artifacts("/art", "claude", moved)
+        self.assertEqual(before, unchanged)
+        for was, now in zip(before, after):
+            self.assertNotEqual(was, now)
+
+    def test_a_judges_files_are_where_the_run_keeps_them(self):
+        infile, mapfile, outfile, step_id = MOD._jury_artifacts("/art", "claude", [])
+        for path in (infile, mapfile, outfile):
+            self.assertTrue(path.startswith(os.path.join("/art", "round2") + os.sep), path)
+        self.assertTrue(step_id.startswith("r2-claude-jury-"), step_id)
+        self.assertTrue(mapfile.endswith("-map.json"), mapfile)
+
+    def test_the_merge_moves_with_its_candidate_list(self):
+        one = [{"id": "claude-1", "title": "a"}]
+        two = one + [{"id": "codex-1", "title": "b"}]
+        before = MOD._merge_artifacts("/art", one)
+        after = MOD._merge_artifacts("/art", two)
+        self.assertEqual(before, MOD._merge_artifacts("/art", list(one)))
+        for was, now in zip(before, after):
+            self.assertNotEqual(was, now)
+        self.assertTrue(before[2].startswith("merge-semantic-"), before[2])
+
+    def test_the_arbiter_moves_when_a_harness_stops_being_a_failure(self):
+        """The defect #7 closed: the repaired execution's prompt no longer lists it."""
+        findings = [{"id": "claude-1"}]
+        failed = {"codex": "no usable findings file"}
+        self.assertNotEqual(MOD._arbiter_artifacts("/art", findings, failed),
+                            MOD._arbiter_artifacts("/art", findings, {}))
+
+    def test_the_arbiter_moves_when_the_findings_move_under_the_same_failures(self):
+        """They reach it through a file the prompt only names, so nothing else would."""
+        self.assertNotEqual(
+            MOD._arbiter_artifacts("/art", [{"id": "claude-1"}], {}),
+            MOD._arbiter_artifacts("/art", [{"id": "claude-1"}, {"id": "codex-1"}], {}))
+
+    def test_an_arbiter_given_the_same_thing_twice_replays(self):
+        findings, failures = [{"id": "claude-1"}], {"codex": "silent"}
+        self.assertEqual(MOD._arbiter_artifacts("/art", findings, failures),
+                         MOD._arbiter_artifacts("/art", list(findings), dict(failures)))
+
+    def test_the_arbiters_report_moves_with_its_id(self):
+        """A fixed report path let a silent arbiter inherit the last execution's review."""
+        findings = [{"id": "claude-1"}]
+        before, before_step = MOD._arbiter_artifacts("/art", findings, {"codex": "silent"})
+        after, after_step = MOD._arbiter_artifacts("/art", findings, {})
+        self.assertNotEqual(before, after)
+        self.assertNotEqual(before_step, after_step)
+        self.assertTrue(before.startswith(os.path.join("/art", "final-review-")), before)
+        self.assertTrue(before.endswith(".md"), before)
+
+
+class RetryMarkers(unittest.TestCase):
+    """`_mark_retried` / `_retried`: the record has to outlive the execution that made it.
+
+    After a resume the retry's own output is already on disk, so the branch that records
+    one is never entered. An in-memory list reported no retries for a run that had needed
+    one, and that is the bug these two exist to keep from coming back.
+    """
+
+    def test_a_marker_is_named_after_the_step_and_outlives_its_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            MOD._mark_retried(directory, "r1-codex")
+            self.assertEqual(os.listdir(directory), ["r1-codex"])
+            # A second execution over the same artifacts: nothing marks, and it still reads.
+            self.assertEqual(MOD._retried(directory), ["r1-codex"])
+
+    def test_marks_come_back_in_a_stable_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for step_id in ("r2-opencode-jury-ab12cd34ef", "r1-codex"):
+                MOD._mark_retried(directory, step_id)
+            self.assertEqual(MOD._retried(directory),
+                             ["r1-codex", "r2-opencode-jury-ab12cd34ef"])
+
+    def test_a_run_that_needed_none_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(MOD._retried(directory), [])
+
+
+class Arbitration(unittest.TestCase):
+    """`_arbitrate`: what the last stage publishes, and what it refuses to.
+
+    This is the stage each of the last five review rounds found a defect in, every one of
+    them on a resume, and none of it was reachable by a test until now. `run` is injected
+    exactly as `_twice` takes it, so these drive the real thing without a model harness.
+    """
+
+    def setUp(self):
+        box = tempfile.TemporaryDirectory()
+        self.addCleanup(box.cleanup)
+        self.report = os.path.join(box.name, "final-review-d2.md")
+        self.final = os.path.join(box.name, "final-review.md")
+        self.marked = []
+
+    def _run(self, writes_on=(), errors=None):
+        """A `run` that writes the bound report for the step ids in `writes_on`."""
+        calls = []
+
+        def run(step_id):
+            calls.append(step_id)
+            if errors and step_id in errors:
+                return errors[step_id]
+            if step_id in writes_on:
+                open(self.report, "w", encoding="utf-8").write("# Report\n\nIt holds.\n")
+            return None
+
+        return run, calls
+
+    def _arbitrate(self, run):
+        return MOD._arbitrate(run, self.report, self.final, "arbiter-d2", "3",
+                              self.marked.append)
+
+    def test_a_silent_arbiter_leaves_the_earlier_review_where_it_is(self):
+        """The defect: a fixed report path let it inherit that review and exit 0."""
+        earlier = "# Older\n\nFrom another input.\n"
+        open(self.final, "w", encoding="utf-8").write(earlier)
+        run, calls = self._run()
+        published, err = self._arbitrate(run)
+        self.assertIsNone(published)
+        self.assertIn("no usable report at", err)
+        self.assertIn(self.report, err)
+        self.assertEqual(open(self.final, encoding="utf-8").read(), earlier)
+        self.assertEqual(calls, ["arbiter-d2", "arbiter-d2-retry-3"])
+        self.assertEqual(self.marked, ["arbiter-d2"])
+
+    def test_a_retry_that_delivered_is_what_gets_published(self):
+        run, calls = self._run(writes_on={"arbiter-d2-retry-3"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (self.final, None))
+        self.assertEqual(open(self.final, encoding="utf-8").read(),
+                         open(self.report, encoding="utf-8").read())
+        self.assertEqual(self.marked, ["arbiter-d2"])
+
+    def test_a_first_attempt_that_delivered_is_not_run_again(self):
+        run, calls = self._run(writes_on={"arbiter-d2"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (self.final, None))
+        self.assertEqual(calls, ["arbiter-d2"])
+        self.assertEqual(self.marked, [])
+
+    def test_a_step_that_failed_publishes_nothing(self):
+        run, _ = self._run(errors={"arbiter-d2": "boom"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (None, "boom"))
+        self.assertFalse(os.path.exists(self.final))
+
+    def test_a_report_too_thin_to_be_one_is_not_published(self):
+        """`_report_is_usable` is structural: a lone heading is non-delivery."""
+        open(self.report, "w", encoding="utf-8").write("# PR #7 cross-review\n")
+        run, calls = self._run()
+        published, err = self._arbitrate(run)
+        self.assertIsNone(published)
+        self.assertFalse(os.path.exists(self.final))
+        self.assertEqual(calls, ["arbiter-d2", "arbiter-d2-retry-3"])
+
+
+class Wiring(unittest.TestCase):
+    """The call sites the suite cannot import, read as source instead.
+
+    `_jury_artifacts`, `_merge_artifacts` and `_arbiter_artifacts` are tested above as
+    functions, but everything that USES them is below the `__main__` guard, where `_load`
+    never reaches. Reverting a call site to a fixed step id therefore left the whole suite
+    green -- which is how the arbiter shipped unbound after the commit whose title said it
+    had been bound. These read the file, because the binding is only worth anything at the
+    call.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse(open(SCRIPT, encoding="utf-8").read())
+        cls.calls = [n for n in ast.walk(cls.tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+
+    def _calls_to(self, name):
+        return [c for c in self.calls if c.func.id == name]
+
+    def _unpacked_from(self, name, func):
+        """The assignment that binds `name` out of a call to `func`, or None."""
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            if getattr(node.value.func, "id", None) != func:
+                continue
+            for target in node.targets:
+                names = target.elts if isinstance(target, ast.Tuple) else [target]
+                if any(isinstance(n, ast.Name) and n.id == name for n in names):
+                    return node
+        return None
+
+    def test_no_step_is_given_a_step_id_that_cannot_move(self):
+        """A literal is the regression: same id, changed input, DIVERGED or a stale replay."""
+        calls = self._calls_to("step")
+        self.assertTrue(calls, "no step() call found -- this test has gone blind")
+        for call in calls:
+            given = [kw.value for kw in call.keywords if kw.arg == "step_id"]
+            self.assertEqual(len(given), 1,
+                             "step() at line %d does not name a step_id" % call.lineno)
+            self.assertNotIsInstance(given[0], ast.Constant,
+                                     "step() at line %d takes a literal step id" % call.lineno)
+
+    def _arbitrate_call(self):
+        calls = self._calls_to("_arbitrate")
+        self.assertEqual(len(calls), 1, "expected exactly one _arbitrate call")
+        return calls[0]
+
+    def test_the_judge_runs_under_its_bound_id(self):
+        passed = [call.args[2].id for call in self._calls_to("_twice")
+                  if len(call.args) > 2 and isinstance(call.args[2], ast.Name)]
+        self.assertIn("jury_step", passed)
+        self.assertIsNotNone(self._unpacked_from("jury_step", "_jury_artifacts"))
+
+    def test_the_arbiter_runs_under_its_bound_id_and_writes_to_its_bound_report(self):
+        """Both halves of the tuple, because each closed a defect of its own."""
+        self.assertIsNotNone(self._unpacked_from("_arbiter_step", "_arbiter_artifacts"))
+        self.assertIsNotNone(self._unpacked_from("_arbiter_report", "_arbiter_artifacts"))
+        args = [getattr(a, "id", None) for a in self._arbitrate_call().args]
+        self.assertEqual(args[1:4], ["_arbiter_report", "FINAL", "_arbiter_step"])
+
+    def test_the_arbiter_is_asked_for_the_bound_report_not_the_published_one(self):
+        """`FINAL` in the prompt is the stale-review bug: it is never truncated."""
+        prompts = [n for n in ast.walk(self.tree)
+                   if isinstance(n, ast.Assign)
+                   and any(getattr(t, "id", None) == "_arbiter_prompt" for t in n.targets)]
+        self.assertEqual(len(prompts), 1)
+        names = {n.id for n in ast.walk(prompts[0]) if isinstance(n, ast.Name)}
+        self.assertIn("_arbiter_report", names)
+        self.assertNotIn("FINAL", names)
+
+    def test_the_merge_runs_under_its_bound_id(self):
+        self.assertIsNotNone(self._unpacked_from("_merge_step", "_merge_artifacts"))
+        ids = [kw.value for call in self._calls_to("step") for kw in call.keywords
+               if kw.arg == "step_id" and isinstance(kw.value, ast.Name)]
+        self.assertIn("_merge_step", [n.id for n in ids])
+
+    def test_only_a_report_this_execution_published_is_named(self):
+        """`FINAL` may hold an earlier execution's review; `REPORT` is what this one made."""
+        target = self._arbitrate_call()
+        assigns = [n for n in ast.walk(self.tree)
+                   if isinstance(n, ast.Assign) and n.value is target]
+        self.assertEqual(len(assigns), 1)
+        names = [getattr(e, "id", None) for t in assigns[0].targets for e in
+                 (t.elts if isinstance(t, ast.Tuple) else [t])]
+        self.assertEqual(names[0], "REPORT")
+        notes = self._calls_to("_exit_note")
+        self.assertEqual([getattr(c.args[1], "id", None) for c in notes], ["REPORT"])
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                if getattr(key, "value", None) == "final_review":
+                    self.assertEqual(getattr(value, "id", None), "REPORT")
+
+    def test_the_arbiters_id_is_taken_before_the_call_that_uses_it(self):
+        """Later, and `failures` has the arbiter's own error in it -- a different digest."""
+        bound = self._unpacked_from("_arbiter_step", "_arbiter_artifacts")
+        self.assertLess(bound.lineno, self._arbitrate_call().lineno)
 
 
 if __name__ == "__main__":
