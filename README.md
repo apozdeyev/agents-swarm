@@ -216,6 +216,11 @@ part of its prompt, so a repaired execution asks it something different, and und
 fixed id CAO calls that divergence and halts the run at the last stage. Same input, same
 digest, same id: it still replays. Different input, different everything: it runs again.
 
+The arbiter writes `final-review-<digest>.md` and that is what is checked for a report;
+`final-review.md` is a copy of the one that passed, since the run summary, the exit note
+and `./cao review` all know it by that name. A fixed path would have let an arbiter that
+wrote nothing inherit the previous execution's review and call the run a success.
+
 Run it directly for more control:
 
 ```sh
