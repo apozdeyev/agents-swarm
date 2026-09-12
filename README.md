@@ -148,8 +148,12 @@ scraped off the pane only once output goes quiet — which is also what a model 
 between tool calls looks like, so a live review can be torn down mid-file (seen at 13s,
 32s and 61s, on all three harnesses). Only non-delivery is retried: "reviewed, found
 nothing" is an empty findings list, never a missing file, and a judge that ruled on some
-of the findings is reported as partial rather than re-run. The second attempt uses step
-id `<id>-retry`, and the run's JSON output names what needed one under `retried`.
+of the findings is reported as partial rather than re-run. The second attempt's step id
+carries the run's generation (`<id>-retry-<generation>`), which CAO bumps on every
+resume: a fixed id would be replayed from the journal, so a resume of a run that lost a
+harness twice would repair nothing. What needed a second attempt is recorded as an empty
+file under `<artifacts>/retried/` and reported in the run's JSON output as `retried` —
+on disk rather than in memory, so a resume still knows.
 
 The report is copied out when the run finishes — there is no bind mount, so what stays
 in the container stays in a volume:
@@ -201,6 +205,21 @@ is in the JSON `./cao review` prints, and `final_review` there is the exact path
 `final-review.md` is the report; `round1/*.json`, `merged.json`, `round2/*.json` and
 `round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
 debugging the pipeline itself.
+
+Every stage after round 1 carries a digest of what went into it — round 2's files and
+the semantic merge's, and all three of those steps' ids, the arbiter's included. A
+judge's anonymous ids are positional over its own target list, so a resume whose round 1
+recovered a harness renumbers them, and a step whose id had not moved would have replayed
+its old verdicts against the new numbering, attaching a ruling to the wrong finding. The
+arbiter has the same problem from the other side: the failures it is told to report are
+part of its prompt, so a repaired execution asks it something different, and under a
+fixed id CAO calls that divergence and halts the run at the last stage. Same input, same
+digest, same id: it still replays. Different input, different everything: it runs again.
+
+The arbiter writes `final-review-<digest>.md` and that is what is checked for a report;
+`final-review.md` is a copy of the one that passed, since the run summary, the exit note
+and `./cao review` all know it by that name. A fixed path would have let an arbiter that
+wrote nothing inherit the previous execution's review and call the run a success.
 
 Run it directly for more control:
 

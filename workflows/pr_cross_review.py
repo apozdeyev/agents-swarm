@@ -17,6 +17,7 @@ from the inputs and the run id -- both stable across a resume -- and nothing her
 the clock or an RNG.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,10 @@ REPO = WT
 # The run this execution belongs to. CAO sets it and keeps it across a resume, so it
 # names one review from end to end. Absent only when the script is run by hand.
 RUN_ID = os.environ.get("CAO_WORKFLOW_RUN_ID", "") or "no-run-id"
+# Bumped by CAO on every resume (INV-6) and handed to the script process alongside
+# the run id. It exists here for one reason, spelled out in _twice: a retry that has
+# to be repeatable across a resume cannot keep a fixed step id.
+GENERATION = os.environ.get("CAO_WORKFLOW_GENERATION", "") or "0"
 
 # Outside the checkout, so a review run never dirties the git tree. Keyed by owner as
 # well as name -- two repos of the same name from different owners are different repos
@@ -289,6 +294,28 @@ def _jury_targets(deduped, key):
     return [f for f in deduped if not f["corroborated"] and key not in f["sources"]]
 
 
+JUDGE_FIELDS = ("file", "line", "severity", "category", "title", "detail", "failure_scenario")
+
+
+def _anonymize(targets):
+    """Return (payload for the judge, anonymous id -> real id).
+
+    Ids are positional, so they mean nothing outside the exact target list they were
+    built from -- a list that CAN change on resume, once a round-1 retry delivers what
+    the first execution did not. `_digest` over this payload is what keeps a verdict file
+    with the numbering it was written against. Each judge gets its own numbering because
+    each sees a different subset.
+    """
+    payload, id_map = [], {}
+    for position, finding in enumerate(targets, 1):
+        anon = "f-%02d" % position
+        id_map[anon] = finding["id"]
+        item = {"id": anon}
+        item.update({k: finding[k] for k in JUDGE_FIELDS})
+        payload.append(item)
+    return payload, id_map
+
+
 def _resume_plan(pinned, diff_exists, meta_exists, worktree_head):
     """What stage 0 has to do: (is this run's own material here, the commit to review).
 
@@ -352,16 +379,18 @@ def _exit_note(code, final, failures):
     A non-zero exit makes CAO drop the sentinel `emit_output` just wrote -- the run is
     recorded FAILED and its output goes with it -- and the stderr tail is what the run
     record keeps in its place. So it carries the two things a reader is left needing:
-    which stage did not deliver, and where the report that WAS produced is. The path
-    only when the file exists, because the arbiter failing to write it is one of the
-    ways to get here and naming a path that is not there is worse than saying nothing.
+    which stage did not deliver, and where the report that WAS produced is. `final` is
+    None when THIS execution produced none: the file can still be there, left by an
+    earlier execution of the same run over different input, and pointing a reader at a
+    review of something else is worse than pointing nowhere. It is checked for existence
+    as well, because the arbiter failing to write is one of the ways to get here.
     """
     if not code:
         return ""
     note = []
     if failures:
         note.append("failures: %s\n" % json.dumps(failures, sort_keys=True))
-    if os.path.exists(final):
+    if final and os.path.exists(final):
         note.append("final review: %s\n" % final)
     return "".join(note)
 
@@ -422,6 +451,169 @@ def _report_is_usable(path):
     return len([line for line in text.splitlines() if line.strip()]) >= 2
 
 
+def _digest(payload):
+    """A short, stable name for exactly this input.
+
+    A step whose input changed has to be a different step. CAO keys a step by its id and
+    compares the call fingerprint stored under it: an unchanged call replays, and a
+    changed one under the SAME id is reported as divergence and halts the run
+    (`services/step_replay.py`, rule 6). So the id itself has to move with the input,
+    and this is what moves it.
+
+    Round 2 is where that bites. Its ids are positional over one judge's target list, so
+    the same `f-01` names a different finding as soon as the list changes -- which it
+    can, now that a round-1 retry really executes on resume: a harness that was silent
+    can deliver, its findings can corroborate an existing one out of a judge's targets or
+    add new ones. With a fixed id the jury step replayed its old verdicts against the new
+    numbering, and a rejection of one finding was read as a rejection of another.
+
+    sha1 over the sorted JSON: the payload is plain data, key order cannot make two
+    identical inputs look different, and ten hex characters is far more than enough to
+    tell one execution's input from another's.
+    """
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+
+
+def _jury_artifacts(art, key, payload):
+    """Every name one judge's execution uses, bound to the payload it is given.
+
+    Returned together because they have to move together. The step id alone is not
+    enough -- a changed prompt under an unchanged id is DIVERGED, which halts the run --
+    and the files alone are not either, since the id is what CAO looks the row up by.
+    Same targets: same digest, same names, and the verdicts replay, which is what a
+    stable id was for. Moved targets: nothing matches and the judge rules again, instead
+    of its old verdicts being read through a numbering they were never written against.
+    """
+    digest = _digest(payload)
+    round2 = os.path.join(art, "round2")
+    return (os.path.join(round2, "to-judge-by-%s-%s.json" % (key, digest)),
+            # Kept next to it so a run stays debuggable: the verdict file the judge
+            # writes is in anonymous ids, and this is the only record of what they
+            # stood for.
+            os.path.join(round2, "to-judge-by-%s-%s-map.json" % (key, digest)),
+            os.path.join(round2, "%s-verdicts-%s.json" % (key, digest)),
+            "r2-%s-jury-%s" % (key, digest))
+
+
+def _merge_artifacts(art, payload):
+    """The same binding for the semantic merge, whose input is the candidate list."""
+    digest = _digest(payload)
+    return (os.path.join(art, "dedup-candidates-%s.json" % digest),
+            os.path.join(art, "dedup-merges-%s.json" % digest),
+            "merge-semantic-%s" % digest)
+
+
+def _arbiter_artifacts(art, findings, failures):
+    """The report the arbiter writes, and the step that writes it, bound to its input.
+
+    `failures` is rendered into its prompt, so the prompt of a repaired execution differs
+    from the one journalled by the execution that failed -- a harness that was silent is
+    no longer listed. Under a fixed id that is divergence, and the run halts at the last
+    stage with no report, on exactly the resume the retry exists to make work. The
+    findings go in too: they reach the arbiter through a file the prompt only names, so
+    nothing else here would notice them changing.
+
+    The report carries the digest for a second reason, and binding the id without it made
+    that reachable: `final-review.md` is never truncated, so an arbiter that came back
+    `completed` having written nothing passed the usability check on the PREVIOUS
+    execution's report and the run exited 0 -- success, over a review that never saw the
+    finding the resume had just recovered and still naming a harness that had since
+    delivered. Bound, the check asks after the report this input produces, while a replay
+    of an unchanged row still finds the file its own execution wrote.
+    """
+    digest = _digest({"findings": findings, "failures": failures})
+    return os.path.join(art, "final-review-%s.md" % digest), "arbiter-%s" % digest
+
+
+def _arbitrate(run, report, final, step_id, generation, mark):
+    """Drive the last stage: run it, check what it actually wrote, publish that.
+
+    Returns (published, error). `published` is `final` when this execution's report passed
+    and was copied there, and None otherwise; `error` is what belongs under
+    `failures["arbiter"]`, or None.
+
+    The arbiter writes to a path bound to its input while `final` is fixed, because
+    `final-review.md` is the one name the run summary, the exit note and `./cao review`
+    know. So the report is copied there rather than written there, and only when this
+    execution produced it: a failed arbiter leaves the previous execution's review where
+    it is and names the file that is missing, instead of publishing a review of different
+    input under the name of this one.
+
+    `run` is injected for the same reason `_twice` takes it -- so this can be tested
+    without a model harness. It is the stage the last five review rounds each found a
+    defect in, and it had never been reachable by a test.
+    """
+    written, err = _twice(run, lambda: report if _report_is_usable(report) else None,
+                          step_id, generation, mark)
+    if err:
+        return None, err
+    if written is None:
+        return None, "no usable report at %s (%d bytes)" % (
+            report, os.path.getsize(report) if os.path.exists(report) else 0)
+    shutil.copyfile(written, final)
+    return final, None
+
+
+def _mark_retried(directory, step_id):
+    """Record that `step_id` needed a second attempt.
+
+    A file rather than an entry in a list: a list is rebuilt empty by every execution,
+    and after a resume the retry's own output is already on disk, so the branch that
+    would append is never entered and the run reports no retry for one it needed.
+    """
+    open(os.path.join(directory, step_id), "w").close()
+
+
+def _retried(directory):
+    """Which steps needed one, across every execution of this run."""
+    return sorted(os.listdir(directory))
+
+
+def _twice(run, load, step_id, generation, mark):
+    """Run one step, and run it once more when it delivered nothing.
+
+    `run(step_id)` returns None when the step ran and the error text when it did not.
+    `load()` returns what the step delivered, or None for "nothing arrived". Returns
+    (value, error): value is None when error is set, and when both attempts delivered
+    nothing. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
+    id -- what is worth recording is that the step needed one, not which try it was.
+
+    Why a step that came back `completed` is run again at all: CAO ends a step on ONE
+    reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
+    requires the step to have been observed working AND three consecutive polls, its
+    COMPLETED exit requires neither), and that status is scraped off the pane only once
+    output goes quiet. A model thinking between tool calls writes nothing to the pane, so
+    the quiet reads as a finished turn: the pane is torn down mid-step and the harness
+    never writes its file. Observed on Codex at 61s and at 13s and on Claude at 32s, in
+    round 1 and in round 2 -- it is not one harness's TUI.
+
+    The generation goes into the retry's id because a fixed one cannot repair the very
+    case this exists for. A retry that silently failed too leaves a `completed` row whose
+    call fingerprint still matches, and `services/step_replay.py` rule 10 replays any such
+    row -- `recovery="idempotent"` does not force re-execution of one -- so a plain
+    `cao workflow resume` would return both calls instantly, find nothing on disk again,
+    and fail identically with no agent having run. A generation-stamped id is new on each
+    resume and therefore executes, while the first attempt keeps its stable id and still
+    replays when it really did deliver.
+
+    What counts as delivered is the caller's to decide, because the two rounds disagree:
+    round 1 takes an empty findings list as an answer -- "I looked and found nothing" --
+    while for round 2 an empty verdict set means nobody voted.
+    """
+    err = run(step_id)
+    if err:
+        return None, err
+    value = load()
+    if value is not None:
+        return value, None
+    mark(step_id)
+    err = run("%s-retry-%s" % (step_id, generation))
+    if err:
+        return None, err
+    return load(), None
+
+
 # Everything above this line is pure: no network, no filesystem, no clock. Everything
 # below clones a repository and drives three model harnesses. CAO runs this file as a
 # script (`python pr_cross_review.py`, its own process), so the guard fires only for
@@ -442,6 +634,13 @@ LOCKS = os.path.join(WORKSPACE, ".cao-repos")
 
 os.makedirs(os.path.join(ART, "round1"), exist_ok=True)
 os.makedirs(os.path.join(ART, "round2"), exist_ok=True)
+# One empty file per step that had to be run twice, named after the step. On disk rather
+# than in a list, because a list is rebuilt empty by every execution: after a resume the
+# retry's own output is already there, the retry branch is never entered, and the run
+# would report no retries for a run that needed one. Everything else here derives from
+# the artifacts on disk; so does this.
+RETRIED = os.path.join(ART, "retried")
+os.makedirs(RETRIED, exist_ok=True)
 
 
 def _git(*args, **kwargs):
@@ -661,23 +860,6 @@ R1_PROMPT = (
 )
 
 
-# Why a step that came back `completed` is worth running a second time: CAO ends a step
-# on ONE reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
-# requires the step to have been observed working AND three consecutive polls, its
-# COMPLETED exit requires neither), and that status is scraped off the pane only once
-# output goes quiet. A model thinking between tool calls writes nothing to the pane, so
-# the quiet reads as a finished turn: the pane is torn down mid-step and the harness
-# never writes its file. Observed on Codex at 61s and at 13s and on Claude at 32s, in
-# round 1 and in round 2 -- it is not one harness's TUI.
-#
-# Only non-delivery is retried. "I reviewed this and found nothing" is an empty list,
-# never a missing file, so an honest silence is never re-run.
-#
-# Which steps had to be run twice. Appended from the pool threads -- list.append is
-# atomic, and the order only has to be stable by the time it is sorted for the output.
-RETRIED = []
-
-
 def _step_or_error(provider, agent, prompt, step_id):
     """Run one agent step. Returns None when it ran, the error text when it did not.
 
@@ -700,22 +882,17 @@ def _review(spec):
     key, provider, agent = spec
     out = os.path.join(ART, "round1", "%s.json" % key)
     prompt = R1_PROMPT % (PR, REPO, DIFF, META, out, FINDING_SHAPE)
-    err = _step_or_error(provider, agent, prompt, "r1-%s" % key)
-    if err:
-        return key, [], err
     # A step can report `completed` without the work having happened -- the harnesses are
     # driven through their TUI, and a judge has been seen cut short mid-reasoning, having
     # written nothing, yet still coming back completed. So the difference between
-    # "reviewed, found nothing" and "never delivered" is read off the disk, not the state.
-    found = _load_round1(out, key)
-    if found is None:
-        # See RETRIED: nothing was delivered, and the cheapest answer to a pane torn
-        # down mid-review is to review again.
-        RETRIED.append("r1-%s" % key)
-        err = _step_or_error(provider, agent, prompt, "r1-%s-retry" % key)
-        if err:
-            return key, [], err
-        found = _load_round1(out, key)
+    # "reviewed, found nothing" and "never delivered" is read off the disk, not the state,
+    # and the second is worth one more attempt.
+    found, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
+                        lambda: _load_round1(out, key),
+                        "r1-%s" % key, GENERATION,
+                        lambda step_id: _mark_retried(RETRIED, step_id))
+    if err:
+        return key, [], err
     if found is None:
         return key, [], "no usable findings file at %s" % out
     return key, found, None
@@ -727,9 +904,14 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
 round1 = {key: found for key, found, _ in _r1}
 failures = {key: err for key, _, err in _r1 if err}
 
+# The report THIS execution published, or None. `FINAL` may hold one an earlier execution
+# of the same run wrote over different input, and that is not this run's answer.
+REPORT = None
+
+
 def _finish(code):
     """Exit, saying on stderr what a failed run's dropped output would have said."""
-    sys.stderr.write(_exit_note(code, FINAL, failures))
+    sys.stderr.write(_exit_note(code, REPORT, failures))
     raise SystemExit(code)
 
 
@@ -741,7 +923,8 @@ if len(failures) == len(HARNESSES):
     # three harnesses came back `completed` having written nothing -- not a step failure,
     # so nothing is journaled either -- was recorded FAILED with the reason nowhere.
     emit_output({"pr": PR, "error": "every harness failed in round 1",
-                 "failures": failures, "retried": sorted(RETRIED)})
+                 "failures": failures,
+                 "generation": GENERATION, "retried": _retried(RETRIED)})
     _finish(1)
 
 
@@ -752,11 +935,13 @@ deduped = _dedup([f for key in sorted(round1) for f in round1[key]])
 # Then an agent pass for the duplicates Python cannot see: the same bug described in
 # different words, at a nearby line, or filed under a different category.
 if len([f for f in deduped if not f["corroborated"]]) > 1:
-    candidates = os.path.join(ART, "dedup-candidates.json")
-    merges_out = os.path.join(ART, "dedup-merges.json")
-    open(candidates, "w").write(json.dumps(
-        [{k: f[k] for k in ("id", "sources", "file", "line", "category", "title", "detail")}
-         for f in deduped], indent=2))
+    # Same binding as round 2, for the same reason: a resume whose round 1 delivered more
+    # than the execution before it hands this stage a different candidate list, and a
+    # stale `merges` read back against it groups findings the model never grouped.
+    _candidates = [{k: f[k] for k in ("id", "sources", "file", "line", "category",
+                                      "title", "detail")} for f in deduped]
+    candidates, merges_out, _merge_step = _merge_artifacts(ART, _candidates)
+    open(candidates, "w").write(json.dumps(_candidates, indent=2))
     merge_prompt = (
         "The JSON array at %s holds code-review findings from three independent reviewers. "
         "Each carries a `sources` field naming which reviewer produced it.\n\n"
@@ -769,7 +954,7 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
     ) % (candidates, merges_out)
     try:
         step("claude_code", "reviewer", merge_prompt,
-             recovery="idempotent", step_id="merge-semantic", timeout=TIMEOUT,
+             recovery="idempotent", step_id=_merge_step, timeout=TIMEOUT,
              working_directory=REPO, allowed_tools=WRITE_TOOLS)
         # The one stage that was not verified on disk. Every other agent step checks
         # its artifact because a step can return `completed` having written nothing --
@@ -805,8 +990,9 @@ if not deduped:
     # who actually delivered, and the exit code says whether anyone did not.
     _delivered = sorted(key for key, _, err in _r1 if not err)
     open(FINAL, "w").write(_empty_report(PR, _delivered, failures))
-    emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures,
-                 "retried": sorted(RETRIED)})
+    REPORT = FINAL
+    emit_output({"pr": PR, "final_review": REPORT, "findings": 0, "failures": failures,
+                 "generation": GENERATION, "retried": _retried(RETRIED)})
     _finish(1 if failures else 0)
 
 # --- stage 2: cross-validation ---------------------------------------------------
@@ -838,25 +1024,6 @@ R2_PROMPT = (
 # prefix in `id`, the `sources` list, and `confidence` -- the reporter's own assessment
 # of itself. A judge who knows who wrote a claim, and how sure they were, is no longer
 # judging it independently, which is the one thing round 2 exists to do.
-JUDGE_FIELDS = ("file", "line", "severity", "category", "title", "detail", "failure_scenario")
-
-
-def _anonymize(targets):
-    """Return (payload for the judge, anonymous id -> real id).
-
-    Ids are positional over an already-deterministic list, so they are stable on resume.
-    Each judge gets its own numbering because each sees a different subset.
-    """
-    payload, id_map = [], {}
-    for position, finding in enumerate(targets, 1):
-        anon = "f-%02d" % position
-        id_map[anon] = finding["id"]
-        item = {"id": anon}
-        item.update({k: finding[k] for k in JUDGE_FIELDS})
-        payload.append(item)
-    return payload, id_map
-
-
 def _validate(spec):
     """`key` is the judge; it validates every finding the other harnesses produced.
 
@@ -871,18 +1038,10 @@ def _validate(spec):
     if not targets:
         return key, {}, None
     payload, id_map = _anonymize(targets)
-    infile = os.path.join(ART, "round2", "to-judge-by-%s.json" % key)
-    # Kept next to it so a run stays debuggable: the verdict file the judge writes is
-    # in anonymous ids, and this is the only record of what they stood for.
-    mapfile = os.path.join(ART, "round2", "to-judge-by-%s-map.json" % key)
-    outfile = os.path.join(ART, "round2", "%s-verdicts.json" % key)
+    infile, mapfile, outfile, jury_step = _jury_artifacts(ART, key, payload)
     open(infile, "w").write(json.dumps(payload, indent=2))
     open(mapfile, "w").write(json.dumps(id_map, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
-    err = _step_or_error(provider, agent, prompt, "r2-%s-jury" % key)
-    if err:
-        return key, {}, err
-
     def _ruled():
         """The verdicts sitting on disk, keyed by the real finding id."""
         out = {}
@@ -897,21 +1056,19 @@ def _validate(spec):
                 out[real_id] = dict(verdict, id=real_id)
         return out
 
-    ruled = _ruled()
     # Same reasoning as round 1, and this is where it actually bit: a jury step finished
     # `completed` having written no verdict file, and an empty dict here is exactly what
     # a judge with nothing to judge returns -- so the run reported no failure while a
-    # third of the jury never voted. Partial coverage is reported too, without throwing
-    # away the verdicts that did arrive.
-    if not ruled:
-        # See RETRIED. The empty case only: a judge that ruled on some of the findings
-        # did deliver, and re-running it would re-judge what it has already answered.
-        RETRIED.append("r2-%s-jury" % key)
-        err = _step_or_error(provider, agent, prompt, "r2-%s-jury-retry" % key)
-        if err:
-            return key, {}, err
-        ruled = _ruled()
-    if not ruled:
+    # third of the jury never voted. `or None` is what tells _twice that: no verdicts at
+    # all is nothing arrived, while SOME verdicts is a delivery, reported partial below
+    # rather than re-run, since re-running re-judges what the judge already answered.
+    ruled, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
+                        lambda: _ruled() or None,
+                        jury_step, GENERATION,
+                        lambda step_id: _mark_retried(RETRIED, step_id))
+    if err:
+        return key, {}, err
+    if ruled is None:
         return key, {}, "judged none of %d findings: no usable verdicts at %s" % (
             len(targets), outfile)
     if len(ruled) < len(targets):
@@ -993,25 +1150,21 @@ ARBITER_PROMPT = (
     "harness or stage failed, say so plainly -- this JSON records it: %s\n\n"
     "Be concise and concrete. Reply with just the path when the file is written."
 )
-try:
-    step("claude_code", "developer",
-         ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, FINAL, json.dumps(failures)),
-         recovery="idempotent", step_id="arbiter", timeout=TIMEOUT,
-         working_directory=REPO, allowed_tools=WRITE_TOOLS)
-except ShimHTTPError as exc:
-    if getattr(exc, "status", None) == 409:
-        raise
-    failures["arbiter"] = str(exc)
-except ShimError as exc:
-    failures["arbiter"] = str(exc)
-
-if "arbiter" not in failures and not _report_is_usable(FINAL):
-    failures["arbiter"] = "no usable report at %s (%d bytes)" % (
-        FINAL, os.path.getsize(FINAL) if os.path.exists(FINAL) else 0)
+# Before the except branches below add to `failures`: what the arbiter was given is what
+# identifies it, not what happened to it afterwards.
+_arbiter_report, _arbiter_step = _arbiter_artifacts(ART, deduped, failures)
+_arbiter_prompt = ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, _arbiter_report,
+                                    json.dumps(failures))
+REPORT, _arbiter_err = _arbitrate(
+    lambda step_id: _step_or_error("claude_code", "developer", _arbiter_prompt, step_id),
+    _arbiter_report, FINAL, _arbiter_step, GENERATION,
+    lambda step_id: _mark_retried(RETRIED, step_id))
+if _arbiter_err:
+    failures["arbiter"] = _arbiter_err
 
 emit_output({
     "pr": PR,
-    "final_review": FINAL,
+    "final_review": REPORT,
     "artifacts": ART,
     "round1": {k: len(v) for k, v in round1.items()},
     "after_dedup": len(deduped),
@@ -1025,7 +1178,10 @@ emit_output({
     "failures": failures,
     # Steps that came back `completed` having written nothing and were run again. Not a
     # failure -- the run recovered -- but a run that needed one did not go as designed.
-    "retried": sorted(RETRIED),
+    # Which execution of this run wrote the output, and what it had to redo. A
+    # generation that never moves is a retry that can never be repaired by a resume.
+    "generation": GENERATION,
+    "retried": _retried(RETRIED),
 })
 
 # Any failure, not just the arbiter's. The two report paths used to disagree on this:
