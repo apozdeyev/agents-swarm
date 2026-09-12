@@ -379,16 +379,18 @@ def _exit_note(code, final, failures):
     A non-zero exit makes CAO drop the sentinel `emit_output` just wrote -- the run is
     recorded FAILED and its output goes with it -- and the stderr tail is what the run
     record keeps in its place. So it carries the two things a reader is left needing:
-    which stage did not deliver, and where the report that WAS produced is. The path
-    only when the file exists, because the arbiter failing to write it is one of the
-    ways to get here and naming a path that is not there is worse than saying nothing.
+    which stage did not deliver, and where the report that WAS produced is. `final` is
+    None when THIS execution produced none: the file can still be there, left by an
+    earlier execution of the same run over different input, and pointing a reader at a
+    review of something else is worse than pointing nowhere. It is checked for existence
+    as well, because the arbiter failing to write is one of the ways to get here.
     """
     if not code:
         return ""
     note = []
     if failures:
         note.append("failures: %s\n" % json.dumps(failures, sort_keys=True))
-    if os.path.exists(final):
+    if final and os.path.exists(final):
         note.append("final review: %s\n" % final)
     return "".join(note)
 
@@ -522,6 +524,35 @@ def _arbiter_artifacts(art, findings, failures):
     """
     digest = _digest({"findings": findings, "failures": failures})
     return os.path.join(art, "final-review-%s.md" % digest), "arbiter-%s" % digest
+
+
+def _arbitrate(run, report, final, step_id, generation, mark):
+    """Drive the last stage: run it, check what it actually wrote, publish that.
+
+    Returns (published, error). `published` is `final` when this execution's report passed
+    and was copied there, and None otherwise; `error` is what belongs under
+    `failures["arbiter"]`, or None.
+
+    The arbiter writes to a path bound to its input while `final` is fixed, because
+    `final-review.md` is the one name the run summary, the exit note and `./cao review`
+    know. So the report is copied there rather than written there, and only when this
+    execution produced it: a failed arbiter leaves the previous execution's review where
+    it is and names the file that is missing, instead of publishing a review of different
+    input under the name of this one.
+
+    `run` is injected for the same reason `_twice` takes it -- so this can be tested
+    without a model harness. It is the stage the last five review rounds each found a
+    defect in, and it had never been reachable by a test.
+    """
+    written, err = _twice(run, lambda: report if _report_is_usable(report) else None,
+                          step_id, generation, mark)
+    if err:
+        return None, err
+    if written is None:
+        return None, "no usable report at %s (%d bytes)" % (
+            report, os.path.getsize(report) if os.path.exists(report) else 0)
+    shutil.copyfile(written, final)
+    return final, None
 
 
 def _mark_retried(directory, step_id):
@@ -873,9 +904,14 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
 round1 = {key: found for key, found, _ in _r1}
 failures = {key: err for key, _, err in _r1 if err}
 
+# The report THIS execution published, or None. `FINAL` may hold one an earlier execution
+# of the same run wrote over different input, and that is not this run's answer.
+REPORT = None
+
+
 def _finish(code):
     """Exit, saying on stderr what a failed run's dropped output would have said."""
-    sys.stderr.write(_exit_note(code, FINAL, failures))
+    sys.stderr.write(_exit_note(code, REPORT, failures))
     raise SystemExit(code)
 
 
@@ -954,7 +990,8 @@ if not deduped:
     # who actually delivered, and the exit code says whether anyone did not.
     _delivered = sorted(key for key, _, err in _r1 if not err)
     open(FINAL, "w").write(_empty_report(PR, _delivered, failures))
-    emit_output({"pr": PR, "final_review": FINAL, "findings": 0, "failures": failures,
+    REPORT = FINAL
+    emit_output({"pr": PR, "final_review": REPORT, "findings": 0, "failures": failures,
                  "generation": GENERATION, "retried": _retried(RETRIED)})
     _finish(1 if failures else 0)
 
@@ -1118,28 +1155,16 @@ ARBITER_PROMPT = (
 _arbiter_report, _arbiter_step = _arbiter_artifacts(ART, deduped, failures)
 _arbiter_prompt = ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, _arbiter_report,
                                     json.dumps(failures))
-# The last stage gets the same second attempt as the others. It could not have it while
-# the report was at a fixed path: a stale `final-review.md` would have answered `load`
-# and suppressed the retry -- which is the same reason finding and fix belong together.
-_written, _arbiter_err = _twice(
+REPORT, _arbiter_err = _arbitrate(
     lambda step_id: _step_or_error("claude_code", "developer", _arbiter_prompt, step_id),
-    lambda: _arbiter_report if _report_is_usable(_arbiter_report) else None,
-    _arbiter_step, GENERATION, lambda step_id: _mark_retried(RETRIED, step_id))
+    _arbiter_report, FINAL, _arbiter_step, GENERATION,
+    lambda step_id: _mark_retried(RETRIED, step_id))
 if _arbiter_err:
     failures["arbiter"] = _arbiter_err
-elif _written is None:
-    failures["arbiter"] = "no usable report at %s (%d bytes)" % (
-        _arbiter_report,
-        os.path.getsize(_arbiter_report) if os.path.exists(_arbiter_report) else 0)
-else:
-    # The one name everything downstream knows: the run summary, the exit note and
-    # `./cao review` all say final-review.md. On a failed arbiter it keeps whatever the
-    # last arbiter of this run did write, and `failures` names the report that is missing.
-    shutil.copyfile(_written, FINAL)
 
 emit_output({
     "pr": PR,
-    "final_review": FINAL,
+    "final_review": REPORT,
     "artifacts": ART,
     "round1": {k: len(v) for k, v in round1.items()},
     "after_dedup": len(deduped),
