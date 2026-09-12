@@ -7,6 +7,7 @@ plain data. That is the half of the workflow where a mistake is invisible -- a w
 path or a wrongly merged finding does not raise, it produces a confident review of the
 wrong thing after fifteen minutes and three live model sessions.
 """
+import ast
 import importlib.util
 import json
 import os
@@ -642,21 +643,32 @@ class StepIdentity(unittest.TestCase):
         self.assertTrue(before[2].startswith("merge-semantic-"), before[2])
 
     def test_the_arbiter_moves_when_a_harness_stops_being_a_failure(self):
-        """The defect this closes: the repaired execution's prompt no longer lists it."""
+        """The defect #7 closed: the repaired execution's prompt no longer lists it."""
         findings = [{"id": "claude-1"}]
         failed = {"codex": "no usable findings file"}
-        self.assertNotEqual(MOD._arbiter_step_id(findings, failed),
-                            MOD._arbiter_step_id(findings, {}))
+        self.assertNotEqual(MOD._arbiter_artifacts("/art", findings, failed),
+                            MOD._arbiter_artifacts("/art", findings, {}))
 
     def test_the_arbiter_moves_when_the_findings_move_under_the_same_failures(self):
         """They reach it through a file the prompt only names, so nothing else would."""
-        self.assertNotEqual(MOD._arbiter_step_id([{"id": "claude-1"}], {}),
-                            MOD._arbiter_step_id([{"id": "claude-1"}, {"id": "codex-1"}], {}))
+        self.assertNotEqual(
+            MOD._arbiter_artifacts("/art", [{"id": "claude-1"}], {}),
+            MOD._arbiter_artifacts("/art", [{"id": "claude-1"}, {"id": "codex-1"}], {}))
 
     def test_an_arbiter_given_the_same_thing_twice_replays(self):
         findings, failures = [{"id": "claude-1"}], {"codex": "silent"}
-        self.assertEqual(MOD._arbiter_step_id(findings, failures),
-                         MOD._arbiter_step_id(list(findings), dict(failures)))
+        self.assertEqual(MOD._arbiter_artifacts("/art", findings, failures),
+                         MOD._arbiter_artifacts("/art", list(findings), dict(failures)))
+
+    def test_the_arbiters_report_moves_with_its_id(self):
+        """A fixed report path let a silent arbiter inherit the last execution's review."""
+        findings = [{"id": "claude-1"}]
+        before, before_step = MOD._arbiter_artifacts("/art", findings, {"codex": "silent"})
+        after, after_step = MOD._arbiter_artifacts("/art", findings, {})
+        self.assertNotEqual(before, after)
+        self.assertNotEqual(before_step, after_step)
+        self.assertTrue(before.startswith(os.path.join("/art", "final-review-")), before)
+        self.assertTrue(before.endswith(".md"), before)
 
 
 class RetryMarkers(unittest.TestCase):
@@ -684,6 +696,74 @@ class RetryMarkers(unittest.TestCase):
     def test_a_run_that_needed_none_says_so(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(MOD._retried(directory), [])
+
+
+class Wiring(unittest.TestCase):
+    """The call sites the suite cannot import, read as source instead.
+
+    `_jury_artifacts`, `_merge_artifacts` and `_arbiter_artifacts` are tested above as
+    functions, but everything that USES them is below the `__main__` guard, where `_load`
+    never reaches. Reverting a call site to a fixed step id therefore left the whole suite
+    green -- which is how the arbiter shipped unbound after the commit whose title said it
+    had been bound. These read the file, because the binding is only worth anything at the
+    call.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse(open(SCRIPT, encoding="utf-8").read())
+        cls.calls = [n for n in ast.walk(cls.tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+
+    def _calls_to(self, name):
+        return [c for c in self.calls if c.func.id == name]
+
+    def _unpacked_from(self, name, func):
+        """The assignment that binds `name` out of a call to `func`, or None."""
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            if getattr(node.value.func, "id", None) != func:
+                continue
+            for target in node.targets:
+                names = target.elts if isinstance(target, ast.Tuple) else [target]
+                if any(isinstance(n, ast.Name) and n.id == name for n in names):
+                    return node
+        return None
+
+    def test_no_step_is_given_a_step_id_that_cannot_move(self):
+        """A literal is the regression: same id, changed input, DIVERGED or a stale replay."""
+        calls = self._calls_to("step")
+        self.assertTrue(calls, "no step() call found -- this test has gone blind")
+        for call in calls:
+            given = [kw.value for kw in call.keywords if kw.arg == "step_id"]
+            self.assertEqual(len(given), 1,
+                             "step() at line %d does not name a step_id" % call.lineno)
+            self.assertNotIsInstance(given[0], ast.Constant,
+                                     "step() at line %d takes a literal step id" % call.lineno)
+
+    def test_the_judge_and_the_arbiter_run_under_their_bound_ids(self):
+        passed = [call.args[2].id for call in self._calls_to("_twice")
+                  if len(call.args) > 2 and isinstance(call.args[2], ast.Name)]
+        self.assertIn("jury_step", passed)
+        self.assertIn("_arbiter_step", passed)
+        self.assertIsNotNone(self._unpacked_from("jury_step", "_jury_artifacts"))
+        self.assertIsNotNone(self._unpacked_from("_arbiter_step", "_arbiter_artifacts"))
+
+    def test_the_merge_runs_under_its_bound_id(self):
+        self.assertIsNotNone(self._unpacked_from("_merge_step", "_merge_artifacts"))
+        ids = [kw.value for call in self._calls_to("step") for kw in call.keywords
+               if kw.arg == "step_id" and isinstance(kw.value, ast.Name)]
+        self.assertIn("_merge_step", [n.id for n in ids])
+
+    def test_the_arbiters_id_is_taken_before_the_call_that_uses_it(self):
+        """Later, and `failures` has the arbiter's own error in it -- a different digest."""
+        bound = self._unpacked_from("_arbiter_step", "_arbiter_artifacts")
+        using = [call for call in self._calls_to("_twice")
+                 if any(isinstance(a, ast.Name) and a.id == "_arbiter_step"
+                        for a in call.args)]
+        self.assertEqual(len(using), 1)
+        self.assertLess(bound.lineno, using[0].lineno)
 
 
 if __name__ == "__main__":

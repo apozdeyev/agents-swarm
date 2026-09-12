@@ -502,8 +502,8 @@ def _merge_artifacts(art, payload):
             "merge-semantic-%s" % digest)
 
 
-def _arbiter_step_id(findings, failures):
-    """The arbiter's identity: the findings it reports on, and what it must report failed.
+def _arbiter_artifacts(art, findings, failures):
+    """The report the arbiter writes, and the step that writes it, bound to its input.
 
     `failures` is rendered into its prompt, so the prompt of a repaired execution differs
     from the one journalled by the execution that failed -- a harness that was silent is
@@ -511,8 +511,17 @@ def _arbiter_step_id(findings, failures):
     stage with no report, on exactly the resume the retry exists to make work. The
     findings go in too: they reach the arbiter through a file the prompt only names, so
     nothing else here would notice them changing.
+
+    The report carries the digest for a second reason, and binding the id without it made
+    that reachable: `final-review.md` is never truncated, so an arbiter that came back
+    `completed` having written nothing passed the usability check on the PREVIOUS
+    execution's report and the run exited 0 -- success, over a review that never saw the
+    finding the resume had just recovered and still naming a harness that had since
+    delivered. Bound, the check asks after the report this input produces, while a replay
+    of an unchanged row still finds the file its own execution wrote.
     """
-    return "arbiter-%s" % _digest({"findings": findings, "failures": failures})
+    digest = _digest({"findings": findings, "failures": failures})
+    return os.path.join(art, "final-review-%s.md" % digest), "arbiter-%s" % digest
 
 
 def _mark_retried(directory, step_id):
@@ -1106,22 +1115,27 @@ ARBITER_PROMPT = (
 )
 # Before the except branches below add to `failures`: what the arbiter was given is what
 # identifies it, not what happened to it afterwards.
-_arbiter_step = _arbiter_step_id(deduped, failures)
-try:
-    step("claude_code", "developer",
-         ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, FINAL, json.dumps(failures)),
-         recovery="idempotent", step_id=_arbiter_step, timeout=TIMEOUT,
-         working_directory=REPO, allowed_tools=WRITE_TOOLS)
-except ShimHTTPError as exc:
-    if getattr(exc, "status", None) == 409:
-        raise
-    failures["arbiter"] = str(exc)
-except ShimError as exc:
-    failures["arbiter"] = str(exc)
-
-if "arbiter" not in failures and not _report_is_usable(FINAL):
+_arbiter_report, _arbiter_step = _arbiter_artifacts(ART, deduped, failures)
+_arbiter_prompt = ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, _arbiter_report,
+                                    json.dumps(failures))
+# The last stage gets the same second attempt as the others. It could not have it while
+# the report was at a fixed path: a stale `final-review.md` would have answered `load`
+# and suppressed the retry -- which is the same reason finding and fix belong together.
+_written, _arbiter_err = _twice(
+    lambda step_id: _step_or_error("claude_code", "developer", _arbiter_prompt, step_id),
+    lambda: _arbiter_report if _report_is_usable(_arbiter_report) else None,
+    _arbiter_step, GENERATION, lambda step_id: _mark_retried(RETRIED, step_id))
+if _arbiter_err:
+    failures["arbiter"] = _arbiter_err
+elif _written is None:
     failures["arbiter"] = "no usable report at %s (%d bytes)" % (
-        FINAL, os.path.getsize(FINAL) if os.path.exists(FINAL) else 0)
+        _arbiter_report,
+        os.path.getsize(_arbiter_report) if os.path.exists(_arbiter_report) else 0)
+else:
+    # The one name everything downstream knows: the run summary, the exit note and
+    # `./cao review` all say final-review.md. On a failed arbiter it keeps whatever the
+    # last arbiter of this run did write, and `failures` names the report that is missing.
+    shutil.copyfile(_written, FINAL)
 
 emit_output({
     "pr": PR,
