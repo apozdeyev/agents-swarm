@@ -206,6 +206,13 @@ is in the JSON `./cao review` prints, and `final_review` there is the exact path
 `round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
 debugging the pipeline itself.
 
+Round 2's files and the semantic merge's carry a digest of what went into them, and so
+do those steps' ids. A judge's ids are positional over its own target list, so a resume
+whose round 1 recovered a harness renumbers them — and a step whose id had not moved
+would have replayed its old verdicts against the new numbering, attaching a ruling to
+the wrong finding. Same input, same digest, same id: it still replays. Different input,
+different everything: it judges again.
+
 Run it directly for more control:
 
 ```sh

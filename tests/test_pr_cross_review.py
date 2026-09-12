@@ -582,5 +582,64 @@ class SecondAttempt(unittest.TestCase):
         self.assertEqual(marked, ["r1-codex"])
 
 
+class StepIdentity(unittest.TestCase):
+    """`_digest`: a step whose input changed has to be a different step.
+
+    Round 2's anonymous ids are positional, so `f-01` names a different finding as soon
+    as a judge's target list changes -- which a resume can now do, because a round-1
+    retry really executes there. CAO replays a completed step whose call fingerprint
+    matches and halts loudly on one that does not, so the id has to move with the input.
+    """
+
+    def test_the_same_payload_names_the_same_step(self):
+        payload = [{"id": "f-01", "file": "a.py", "line": 10}]
+        self.assertEqual(MOD._digest(payload), MOD._digest(list(payload)))
+
+    def test_key_order_is_not_a_change(self):
+        self.assertEqual(MOD._digest([{"a": 1, "b": 2}]), MOD._digest([{"b": 2, "a": 1}]))
+
+    def test_a_judge_whose_targets_moved_gets_a_new_id(self):
+        """The defect this closes: same id, new numbering, old verdicts read anyway."""
+        before = MOD._dedup([_finding("claude", 1)])
+        after = MOD._dedup([_finding("claude", 1), _finding("codex", 2, file="b.py")])
+        first, _ = MOD._anonymize(MOD._jury_targets(before, "opencode"))
+        later, _ = MOD._anonymize(MOD._jury_targets(after, "opencode"))
+        self.assertNotEqual(MOD._digest(first), MOD._digest(later))
+
+    def test_an_untouched_judge_keeps_its_id_so_its_verdicts_still_replay(self):
+        first, _ = MOD._anonymize(MOD._jury_targets(MOD._dedup([_finding("claude", 1)]),
+                                                    "opencode"))
+        again, _ = MOD._anonymize(MOD._jury_targets(MOD._dedup([_finding("claude", 1)]),
+                                                    "opencode"))
+        self.assertEqual(MOD._digest(first), MOD._digest(again))
+
+
+class RetryMarkers(unittest.TestCase):
+    """`_mark_retried` / `_retried`: the record has to outlive the execution that made it.
+
+    After a resume the retry's own output is already on disk, so the branch that records
+    one is never entered. An in-memory list reported no retries for a run that had needed
+    one, and that is the bug these two exist to keep from coming back.
+    """
+
+    def test_a_marker_is_named_after_the_step_and_outlives_its_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            MOD._mark_retried(directory, "r1-codex")
+            self.assertEqual(os.listdir(directory), ["r1-codex"])
+            # A second execution over the same artifacts: nothing marks, and it still reads.
+            self.assertEqual(MOD._retried(directory), ["r1-codex"])
+
+    def test_marks_come_back_in_a_stable_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for step_id in ("r2-opencode-jury-ab12cd34ef", "r1-codex"):
+                MOD._mark_retried(directory, step_id)
+            self.assertEqual(MOD._retried(directory),
+                             ["r1-codex", "r2-opencode-jury-ab12cd34ef"])
+
+    def test_a_run_that_needed_none_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(MOD._retried(directory), [])
+
+
 if __name__ == "__main__":
     unittest.main()
