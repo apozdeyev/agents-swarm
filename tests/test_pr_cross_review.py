@@ -416,6 +416,12 @@ class StageZero(unittest.TestCase):
         note = MOD._exit_note(1, os.path.join(self.dir, "nope.md"), {"arbiter": "silent"})
         self.assertIn("arbiter", note)
         self.assertNotIn("final review:", note)
+        # None means this execution published none. The file can still be there, left by
+        # an earlier execution over different input, and that is not this run's answer.
+        note = MOD._exit_note(1, None, {"arbiter": "silent"})
+        self.assertIn("arbiter", note)
+        self.assertNotIn("final review:", note)
+        self.assertNotIn("final review:", note)
 
     def test_a_held_lock_keeps_a_siblings_checkout(self):
         # Inverting this is the one regression that destroys work in progress: the
@@ -698,6 +704,83 @@ class RetryMarkers(unittest.TestCase):
             self.assertEqual(MOD._retried(directory), [])
 
 
+class Arbitration(unittest.TestCase):
+    """`_arbitrate`: what the last stage publishes, and what it refuses to.
+
+    This is the stage each of the last five review rounds found a defect in, every one of
+    them on a resume, and none of it was reachable by a test until now. `run` is injected
+    exactly as `_twice` takes it, so these drive the real thing without a model harness.
+    """
+
+    def setUp(self):
+        box = tempfile.TemporaryDirectory()
+        self.addCleanup(box.cleanup)
+        self.report = os.path.join(box.name, "final-review-d2.md")
+        self.final = os.path.join(box.name, "final-review.md")
+        self.marked = []
+
+    def _run(self, writes_on=(), errors=None):
+        """A `run` that writes the bound report for the step ids in `writes_on`."""
+        calls = []
+
+        def run(step_id):
+            calls.append(step_id)
+            if errors and step_id in errors:
+                return errors[step_id]
+            if step_id in writes_on:
+                open(self.report, "w", encoding="utf-8").write("# Report\n\nIt holds.\n")
+            return None
+
+        return run, calls
+
+    def _arbitrate(self, run):
+        return MOD._arbitrate(run, self.report, self.final, "arbiter-d2", "3",
+                              self.marked.append)
+
+    def test_a_silent_arbiter_leaves_the_earlier_review_where_it_is(self):
+        """The defect: a fixed report path let it inherit that review and exit 0."""
+        earlier = "# Older\n\nFrom another input.\n"
+        open(self.final, "w", encoding="utf-8").write(earlier)
+        run, calls = self._run()
+        published, err = self._arbitrate(run)
+        self.assertIsNone(published)
+        self.assertIn("no usable report at", err)
+        self.assertIn(self.report, err)
+        self.assertEqual(open(self.final, encoding="utf-8").read(), earlier)
+        self.assertEqual(calls, ["arbiter-d2", "arbiter-d2-retry-3"])
+        self.assertEqual(self.marked, ["arbiter-d2"])
+
+    def test_a_retry_that_delivered_is_what_gets_published(self):
+        run, calls = self._run(writes_on={"arbiter-d2-retry-3"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (self.final, None))
+        self.assertEqual(open(self.final, encoding="utf-8").read(),
+                         open(self.report, encoding="utf-8").read())
+        self.assertEqual(self.marked, ["arbiter-d2"])
+
+    def test_a_first_attempt_that_delivered_is_not_run_again(self):
+        run, calls = self._run(writes_on={"arbiter-d2"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (self.final, None))
+        self.assertEqual(calls, ["arbiter-d2"])
+        self.assertEqual(self.marked, [])
+
+    def test_a_step_that_failed_publishes_nothing(self):
+        run, _ = self._run(errors={"arbiter-d2": "boom"})
+        published, err = self._arbitrate(run)
+        self.assertEqual((published, err), (None, "boom"))
+        self.assertFalse(os.path.exists(self.final))
+
+    def test_a_report_too_thin_to_be_one_is_not_published(self):
+        """`_report_is_usable` is structural: a lone heading is non-delivery."""
+        open(self.report, "w", encoding="utf-8").write("# PR #7 cross-review\n")
+        run, calls = self._run()
+        published, err = self._arbitrate(run)
+        self.assertIsNone(published)
+        self.assertFalse(os.path.exists(self.final))
+        self.assertEqual(calls, ["arbiter-d2", "arbiter-d2-retry-3"])
+
+
 class Wiring(unittest.TestCase):
     """The call sites the suite cannot import, read as source instead.
 
@@ -742,13 +825,33 @@ class Wiring(unittest.TestCase):
             self.assertNotIsInstance(given[0], ast.Constant,
                                      "step() at line %d takes a literal step id" % call.lineno)
 
-    def test_the_judge_and_the_arbiter_run_under_their_bound_ids(self):
+    def _arbitrate_call(self):
+        calls = self._calls_to("_arbitrate")
+        self.assertEqual(len(calls), 1, "expected exactly one _arbitrate call")
+        return calls[0]
+
+    def test_the_judge_runs_under_its_bound_id(self):
         passed = [call.args[2].id for call in self._calls_to("_twice")
                   if len(call.args) > 2 and isinstance(call.args[2], ast.Name)]
         self.assertIn("jury_step", passed)
-        self.assertIn("_arbiter_step", passed)
         self.assertIsNotNone(self._unpacked_from("jury_step", "_jury_artifacts"))
+
+    def test_the_arbiter_runs_under_its_bound_id_and_writes_to_its_bound_report(self):
+        """Both halves of the tuple, because each closed a defect of its own."""
         self.assertIsNotNone(self._unpacked_from("_arbiter_step", "_arbiter_artifacts"))
+        self.assertIsNotNone(self._unpacked_from("_arbiter_report", "_arbiter_artifacts"))
+        args = [getattr(a, "id", None) for a in self._arbitrate_call().args]
+        self.assertEqual(args[1:4], ["_arbiter_report", "FINAL", "_arbiter_step"])
+
+    def test_the_arbiter_is_asked_for_the_bound_report_not_the_published_one(self):
+        """`FINAL` in the prompt is the stale-review bug: it is never truncated."""
+        prompts = [n for n in ast.walk(self.tree)
+                   if isinstance(n, ast.Assign)
+                   and any(getattr(t, "id", None) == "_arbiter_prompt" for t in n.targets)]
+        self.assertEqual(len(prompts), 1)
+        names = {n.id for n in ast.walk(prompts[0]) if isinstance(n, ast.Name)}
+        self.assertIn("_arbiter_report", names)
+        self.assertNotIn("FINAL", names)
 
     def test_the_merge_runs_under_its_bound_id(self):
         self.assertIsNotNone(self._unpacked_from("_merge_step", "_merge_artifacts"))
@@ -756,14 +859,28 @@ class Wiring(unittest.TestCase):
                if kw.arg == "step_id" and isinstance(kw.value, ast.Name)]
         self.assertIn("_merge_step", [n.id for n in ids])
 
+    def test_only_a_report_this_execution_published_is_named(self):
+        """`FINAL` may hold an earlier execution's review; `REPORT` is what this one made."""
+        target = self._arbitrate_call()
+        assigns = [n for n in ast.walk(self.tree)
+                   if isinstance(n, ast.Assign) and n.value is target]
+        self.assertEqual(len(assigns), 1)
+        names = [getattr(e, "id", None) for t in assigns[0].targets for e in
+                 (t.elts if isinstance(t, ast.Tuple) else [t])]
+        self.assertEqual(names[0], "REPORT")
+        notes = self._calls_to("_exit_note")
+        self.assertEqual([getattr(c.args[1], "id", None) for c in notes], ["REPORT"])
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                if getattr(key, "value", None) == "final_review":
+                    self.assertEqual(getattr(value, "id", None), "REPORT")
+
     def test_the_arbiters_id_is_taken_before_the_call_that_uses_it(self):
         """Later, and `failures` has the arbiter's own error in it -- a different digest."""
         bound = self._unpacked_from("_arbiter_step", "_arbiter_artifacts")
-        using = [call for call in self._calls_to("_twice")
-                 if any(isinstance(a, ast.Name) and a.id == "_arbiter_step"
-                        for a in call.args)]
-        self.assertEqual(len(using), 1)
-        self.assertLess(bound.lineno, using[0].lineno)
+        self.assertLess(bound.lineno, self._arbitrate_call().lineno)
 
 
 if __name__ == "__main__":
