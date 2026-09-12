@@ -206,6 +206,21 @@ is in the JSON `./cao review` prints, and `final_review` there is the exact path
 `round2/to-judge-by-*-map.json` (which anonymous id was which finding) are kept for
 debugging the pipeline itself.
 
+Every stage after round 1 carries a digest of what went into it — round 2's files and
+the semantic merge's, and all three of those steps' ids, the arbiter's included. A
+judge's anonymous ids are positional over its own target list, so a resume whose round 1
+recovered a harness renumbers them, and a step whose id had not moved would have replayed
+its old verdicts against the new numbering, attaching a ruling to the wrong finding. The
+arbiter has the same problem from the other side: the failures it is told to report are
+part of its prompt, so a repaired execution asks it something different, and under a
+fixed id CAO calls that divergence and halts the run at the last stage. Same input, same
+digest, same id: it still replays. Different input, different everything: it runs again.
+
+The arbiter writes `final-review-<digest>.md` and that is what is checked for a report;
+`final-review.md` is a copy of the one that passed, since the run summary, the exit note
+and `./cao review` all know it by that name. A fixed path would have let an arbiter that
+wrote nothing inherit the previous execution's review and call the run a success.
+
 Run it directly for more control:
 
 ```sh
