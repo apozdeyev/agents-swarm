@@ -473,6 +473,48 @@ def _digest(payload):
         json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
 
 
+def _jury_artifacts(art, key, payload):
+    """Every name one judge's execution uses, bound to the payload it is given.
+
+    Returned together because they have to move together. The step id alone is not
+    enough -- a changed prompt under an unchanged id is DIVERGED, which halts the run --
+    and the files alone are not either, since the id is what CAO looks the row up by.
+    Same targets: same digest, same names, and the verdicts replay, which is what a
+    stable id was for. Moved targets: nothing matches and the judge rules again, instead
+    of its old verdicts being read through a numbering they were never written against.
+    """
+    digest = _digest(payload)
+    round2 = os.path.join(art, "round2")
+    return (os.path.join(round2, "to-judge-by-%s-%s.json" % (key, digest)),
+            # Kept next to it so a run stays debuggable: the verdict file the judge
+            # writes is in anonymous ids, and this is the only record of what they
+            # stood for.
+            os.path.join(round2, "to-judge-by-%s-%s-map.json" % (key, digest)),
+            os.path.join(round2, "%s-verdicts-%s.json" % (key, digest)),
+            "r2-%s-jury-%s" % (key, digest))
+
+
+def _merge_artifacts(art, payload):
+    """The same binding for the semantic merge, whose input is the candidate list."""
+    digest = _digest(payload)
+    return (os.path.join(art, "dedup-candidates-%s.json" % digest),
+            os.path.join(art, "dedup-merges-%s.json" % digest),
+            "merge-semantic-%s" % digest)
+
+
+def _arbiter_step_id(findings, failures):
+    """The arbiter's identity: the findings it reports on, and what it must report failed.
+
+    `failures` is rendered into its prompt, so the prompt of a repaired execution differs
+    from the one journalled by the execution that failed -- a harness that was silent is
+    no longer listed. Under a fixed id that is divergence, and the run halts at the last
+    stage with no report, on exactly the resume the retry exists to make work. The
+    findings go in too: they reach the arbiter through a file the prompt only names, so
+    nothing else here would notice them changing.
+    """
+    return "arbiter-%s" % _digest({"findings": findings, "failures": failures})
+
+
 def _mark_retried(directory, step_id):
     """Record that `step_id` needed a second attempt.
 
@@ -853,9 +895,7 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
     # stale `merges` read back against it groups findings the model never grouped.
     _candidates = [{k: f[k] for k in ("id", "sources", "file", "line", "category",
                                       "title", "detail")} for f in deduped]
-    _merge_digest = _digest(_candidates)
-    candidates = os.path.join(ART, "dedup-candidates-%s.json" % _merge_digest)
-    merges_out = os.path.join(ART, "dedup-merges-%s.json" % _merge_digest)
+    candidates, merges_out, _merge_step = _merge_artifacts(ART, _candidates)
     open(candidates, "w").write(json.dumps(_candidates, indent=2))
     merge_prompt = (
         "The JSON array at %s holds code-review findings from three independent reviewers. "
@@ -869,8 +909,7 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
     ) % (candidates, merges_out)
     try:
         step("claude_code", "reviewer", merge_prompt,
-             recovery="idempotent", step_id="merge-semantic-%s" % _merge_digest,
-             timeout=TIMEOUT,
+             recovery="idempotent", step_id=_merge_step, timeout=TIMEOUT,
              working_directory=REPO, allowed_tools=WRITE_TOOLS)
         # The one stage that was not verified on disk. Every other agent step checks
         # its artifact because a step can return `completed` having written nothing --
@@ -953,17 +992,7 @@ def _validate(spec):
     if not targets:
         return key, {}, None
     payload, id_map = _anonymize(targets)
-    # The three files and the step id all carry the same digest, so one execution's
-    # numbering, the verdicts written against it and the step that produced them stay one
-    # set. A resume with the same targets lands on the same names and replays, which is
-    # what the stable id was for; a resume whose targets moved lands on new ones and
-    # judges again, instead of reading the old verdicts through the new numbering.
-    digest = _digest(payload)
-    infile = os.path.join(ART, "round2", "to-judge-by-%s-%s.json" % (key, digest))
-    # Kept next to it so a run stays debuggable: the verdict file the judge writes is
-    # in anonymous ids, and this is the only record of what they stood for.
-    mapfile = os.path.join(ART, "round2", "to-judge-by-%s-%s-map.json" % (key, digest))
-    outfile = os.path.join(ART, "round2", "%s-verdicts-%s.json" % (key, digest))
+    infile, mapfile, outfile, jury_step = _jury_artifacts(ART, key, payload)
     open(infile, "w").write(json.dumps(payload, indent=2))
     open(mapfile, "w").write(json.dumps(id_map, indent=2))
     prompt = R2_PROMPT % (PR, REPO, infile, DIFF, outfile)
@@ -989,7 +1018,7 @@ def _validate(spec):
     # rather than re-run, since re-running re-judges what the judge already answered.
     ruled, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
                         lambda: _ruled() or None,
-                        "r2-%s-jury-%s" % (key, digest), GENERATION,
+                        jury_step, GENERATION,
                         lambda step_id: _mark_retried(RETRIED, step_id))
     if err:
         return key, {}, err
@@ -1075,10 +1104,13 @@ ARBITER_PROMPT = (
     "harness or stage failed, say so plainly -- this JSON records it: %s\n\n"
     "Be concise and concrete. Reply with just the path when the file is written."
 )
+# Before the except branches below add to `failures`: what the arbiter was given is what
+# identifies it, not what happened to it afterwards.
+_arbiter_step = _arbiter_step_id(deduped, failures)
 try:
     step("claude_code", "developer",
          ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, FINAL, json.dumps(failures)),
-         recovery="idempotent", step_id="arbiter", timeout=TIMEOUT,
+         recovery="idempotent", step_id=_arbiter_step, timeout=TIMEOUT,
          working_directory=REPO, allowed_tools=WRITE_TOOLS)
 except ShimHTTPError as exc:
     if getattr(exc, "status", None) == 409:

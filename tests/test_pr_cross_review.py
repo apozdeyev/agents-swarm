@@ -613,6 +613,51 @@ class StepIdentity(unittest.TestCase):
                                                     "opencode"))
         self.assertEqual(MOD._digest(first), MOD._digest(again))
 
+    def test_a_judges_files_and_its_step_id_move_together(self):
+        """Either alone is a bug: renaming only the files under a fixed id is DIVERGED."""
+        payload = [{"id": "f-01", "file": "a.py"}]
+        moved = [{"id": "f-01", "file": "b.py"}]
+        before = MOD._jury_artifacts("/art", "claude", payload)
+        unchanged = MOD._jury_artifacts("/art", "claude", list(payload))
+        after = MOD._jury_artifacts("/art", "claude", moved)
+        self.assertEqual(before, unchanged)
+        for was, now in zip(before, after):
+            self.assertNotEqual(was, now)
+
+    def test_a_judges_files_are_where_the_run_keeps_them(self):
+        infile, mapfile, outfile, step_id = MOD._jury_artifacts("/art", "claude", [])
+        for path in (infile, mapfile, outfile):
+            self.assertTrue(path.startswith(os.path.join("/art", "round2") + os.sep), path)
+        self.assertTrue(step_id.startswith("r2-claude-jury-"), step_id)
+        self.assertTrue(mapfile.endswith("-map.json"), mapfile)
+
+    def test_the_merge_moves_with_its_candidate_list(self):
+        one = [{"id": "claude-1", "title": "a"}]
+        two = one + [{"id": "codex-1", "title": "b"}]
+        before = MOD._merge_artifacts("/art", one)
+        after = MOD._merge_artifacts("/art", two)
+        self.assertEqual(before, MOD._merge_artifacts("/art", list(one)))
+        for was, now in zip(before, after):
+            self.assertNotEqual(was, now)
+        self.assertTrue(before[2].startswith("merge-semantic-"), before[2])
+
+    def test_the_arbiter_moves_when_a_harness_stops_being_a_failure(self):
+        """The defect this closes: the repaired execution's prompt no longer lists it."""
+        findings = [{"id": "claude-1"}]
+        failed = {"codex": "no usable findings file"}
+        self.assertNotEqual(MOD._arbiter_step_id(findings, failed),
+                            MOD._arbiter_step_id(findings, {}))
+
+    def test_the_arbiter_moves_when_the_findings_move_under_the_same_failures(self):
+        """They reach it through a file the prompt only names, so nothing else would."""
+        self.assertNotEqual(MOD._arbiter_step_id([{"id": "claude-1"}], {}),
+                            MOD._arbiter_step_id([{"id": "claude-1"}, {"id": "codex-1"}], {}))
+
+    def test_an_arbiter_given_the_same_thing_twice_replays(self):
+        findings, failures = [{"id": "claude-1"}], {"codex": "silent"}
+        self.assertEqual(MOD._arbiter_step_id(findings, failures),
+                         MOD._arbiter_step_id(list(findings), dict(failures)))
+
 
 class RetryMarkers(unittest.TestCase):
     """`_mark_retried` / `_retried`: the record has to outlive the execution that made it.
