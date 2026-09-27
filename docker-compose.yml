@@ -5,7 +5,7 @@ services:
       args:
         CAO_VERSION: "2.5.0"
         CLAUDE_VERSION: "2.1.283"
-        CODEX_VERSION: "0.153.2"
+        CODEX_VERSION: "0.157.1"
         OPENCODE_VERSION: "1.18.29"
     image: cao:dev
     container_name: cao

@@ -1,6 +1,9 @@
 ---
 name: reviewer_codex
 provider: codex
+# Pinned for the same reason the Claude one is: left unset it follows whatever the
+# pinned CLI defaults to, and a CLI bump could move it silently. Becomes --model.
+model: gpt-6-astra
 description: Code Reviewer Agent in a multi-agent system (Codex harness)
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 # None of CAO's installed skills are about code review -- they are its own
