@@ -47,6 +47,44 @@ RUN npm install -g --no-fund --no-audit \
 # the sdist carries the prebuilt web UI assets. Only the Rust `cao tui` is lost.
 RUN pip install --no-cache-dir "cli-agent-orchestrator==${CAO_VERSION}"
 
+# Upstream's v2.5.1 is a git tag only: not on PyPI, and its tree lacks the built web_ui/
+# the sdist carries. So the one fix in it this stack needs is applied here instead of
+# installing the tag (awslabs/cli-agent-orchestrator bcc73836, #763): codex-cli
+# alternates the spinner glyph between "•" and "◦", and a status pattern that knew
+# only "•" read a working Codex as finished on every hollow frame -- three of four
+# Codex steps torn down mid-turn in one review here. The assert makes the build fail
+# rather than silently ship an unpatched image once the line moves upstream; drop
+# this step when a PyPI release carries the fix.
+RUN python -c 'import cli_agent_orchestrator.providers.codex as m; \
+p = m.__file__; s = open(p, encoding="utf-8").read(); \
+old, new = "TUI_PROGRESS_PATTERN = r\"•[", "TUI_PROGRESS_PATTERN = r\"[•◦]["; \
+assert s.count(old) == 1, "codex.py no longer has the unpatched pattern: re-check whether this step is still needed"; \
+open(p, "w", encoding="utf-8").write(s.replace(old, new))'
+
+# Same treatment for Claude Code, whose defect has no upstream fix at all. The idle
+# prompt was any ">" or "❯" followed by whitespace, anywhere in the buffer, and once a
+# long thinking phase has scrolled the input box's separators out of the window that
+# is the only thing COMPLETED still hinges on -- so the echo of the pasted task ("❯ You
+# are reviewing…") and even a "=> return" inside Claude's own grep pattern each ended
+# a live step, one of them six minutes and 27k tokens in. The real idle prompt is the
+# glyph ALONE on its line ("❯\xa0"), so that is what this asks for.
+#
+# What is NOT established is how much this buys. The live detector runs on the pyte
+# COMPOSITE of the pane (CAO_PYTE_STATUS is on), and replaying a saved log offline --
+# as the raw stream or fed whole into a fresh screen -- does not reproduce what the
+# monitor actually sees: the two replays disagree with each other, and one of them
+# predicts hangs that have not happened. So judge it on the runs, not on a replay. In
+# the five days after it went in: 46 Claude steps, no step ever ran to its timeout
+# (the failure mode to fear here), and teardowns still occurred. Neutral at worst,
+# and the misreads it removes are real ones. Bound to CLAUDE_VERSION: a TUI that puts
+# placeholder text on the prompt line would never read idle under this, and every
+# step would then hang until its timeout -- re-check that before bumping the pin.
+RUN python -c 'import cli_agent_orchestrator.providers.claude_code as m; \
+p = m.__file__; s = open(p, encoding="utf-8").read(); \
+old, new = "IDLE_PROMPT_PATTERN = r\"[>❯][\\s\\xa0]\"", "IDLE_PROMPT_PATTERN = r\"(?m)^[ \\t]*[>❯][ \\t\\xa0]*$\""; \
+assert s.count(old) == 1, "claude_code.py no longer has the unpatched pattern: re-check whether this step is still needed"; \
+open(p, "w", encoding="utf-8").write(s.replace(old, new))'
+
 RUN useradd --create-home --shell /bin/bash --uid 1000 cao
 
 # A container is always a Claude Code "first run": without this it opens the
