@@ -21,6 +21,7 @@ usage: ./cao <command>
                     the report lands in reports/<name>/<pr>/
   review <owner/name> <pr>
                     same, given repo and number separately
+                    --timeout <seconds> raises the per-step budget (900 by default)
   ui                open the web UI
   logs              follow the server log
   status            container health and login state
@@ -49,8 +50,17 @@ case "$cmd" in
     # The workflow clones and checks the PR out itself, so nothing needs to exist in
     # ~/workspace first. URL parsing lives here and not in the workflow: the workflow's
     # contract stays repo + number, and this is where a pasted link arrives.
-    usage_review() { echo "usage: ./cao review <pr-url> | <owner/name> <pr-number>" >&2; exit 1; }
-    a="${1:-}"; b="${2:-}"
+    usage_review() { echo "usage: ./cao review <pr-url> | <owner/name> <pr-number> [--timeout <seconds>]" >&2; exit 1; }
+    # --timeout is the workflow's step_timeout input: one harness on a 3.8k-line diff
+    # took 20 minutes against the 900 s default and its findings arrived after the merge.
+    step_timeout=""; pos=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --timeout) step_timeout="${2:-}"; shift 2 || usage_review ;;
+        *) pos+=("$1"); shift ;;
+      esac
+    done
+    a="${pos[0]:-}"; b="${pos[1]:-}"
     [ -z "$a" ] && usage_review
     case "$a" in
       *github.com/*/pull/*)
@@ -60,13 +70,15 @@ case "$cmd" in
       *)   usage_review ;;
     esac
     case "$pr" in ''|*[!0-9]*) usage_review ;; esac
+    case "$step_timeout" in *[!0-9]*) usage_review ;; esac
     # The container has no bind mount, so a report nobody copies out lives only in a
     # volume. Keyed by name and PR, the layout reports/ already holds.
     dest="reports/${repo##*/}/$pr"
     mkdir -p "$dest"
     rc=0
     docker compose exec -T "$C" cao workflow run pr_cross_review --wait --json \
-      --input "repo=$repo" --input "pr=$pr" | tee "$dest/run-summary.json" || rc=$?
+      --input "repo=$repo" --input "pr=$pr" ${step_timeout:+--input "step_timeout=$step_timeout"} \
+      | tee "$dest/run-summary.json" || rc=$?
     final=$(jq -r '.output.final_review // empty' "$dest/run-summary.json" 2>/dev/null || true)
     if [ -z "$final" ]; then
       echo "no report produced; run summary kept in $dest/run-summary.json" >&2

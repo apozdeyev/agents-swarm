@@ -113,10 +113,14 @@ out with no visible cause.
 ```sh
 ./cao review https://github.com/owner/name/pull/123
 ./cao review owner/name 123
+./cao review owner/name 123 --timeout 1800   # per-step budget in seconds; 900 by default
 ```
 
 Any repository the logged-in `gh` account can read. Nothing needs to be cloned first:
-the workflow provisions the checkout itself.
+the workflow provisions the checkout itself. `--timeout` is the workflow's `step_timeout`
+input: every agent step, in either round, gets that long. On a 3.8k-line diff
+OpenCode/DeepSeek needed 20 minutes for round 1, and at the default its findings landed
+on disk after the merge had already run without them.
 
 **Review pull requests you trust.** The diff, the title and the body are written by
 whoever opened the PR, and they are read by agents running
