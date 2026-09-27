@@ -853,11 +853,12 @@ class Wiring(unittest.TestCase):
         self.assertIn("_arbiter_report", names)
         self.assertNotIn("FINAL", names)
 
-    def test_the_merge_runs_under_its_bound_id(self):
+    def test_the_merge_gets_a_second_attempt_under_its_bound_id(self):
+        """A bare step() is the regression: one premature COMPLETED failed the whole run."""
         self.assertIsNotNone(self._unpacked_from("_merge_step", "_merge_artifacts"))
-        ids = [kw.value for call in self._calls_to("step") for kw in call.keywords
-               if kw.arg == "step_id" and isinstance(kw.value, ast.Name)]
-        self.assertIn("_merge_step", [n.id for n in ids])
+        passed = [call.args[2].id for call in self._calls_to("_twice")
+                  if len(call.args) > 2 and isinstance(call.args[2], ast.Name)]
+        self.assertIn("_merge_step", passed)
 
     def test_only_a_report_this_execution_published_is_named(self):
         """`FINAL` may hold an earlier execution's review; `REPORT` is what this one made."""
