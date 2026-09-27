@@ -4,7 +4,7 @@ services:
       context: .
       args:
         CAO_VERSION: "2.5.0"
-        CLAUDE_VERSION: "2.1.260"
+        CLAUDE_VERSION: "2.1.283"
         CODEX_VERSION: "0.153.2"
         OPENCODE_VERSION: "1.18.29"
     image: cao:dev
@@ -26,6 +26,10 @@ services:
       # Agents clone and edit inside the container; git refuses to commit without an identity.
       GIT_USER_NAME: "apozdeyev"
       GIT_USER_EMAIL: "anatoliy.pozdeyev@gmail.com"
+      # Every Claude step runs on CAO's built-in reviewer/developer profiles, which set
+      # no model, so no --model is passed and the CLI falls back to this. Unset, the
+      # model silently follows whatever the pinned CLI defaults to.
+      ANTHROPIC_MODEL: "claude-opus-5-5"
     # OpenCode has no interactive login: it enables the deepseek provider from
     # DEEPSEEK_API_KEY in the environment. Kept in .env (gitignored), not here.
     # The mapping form because a plain-string entry is mandatory: .env is gitignored and
