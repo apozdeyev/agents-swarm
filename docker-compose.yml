@@ -30,6 +30,12 @@ services:
       # no model, so no --model is passed and the CLI falls back to this. Unset, the
       # model silently follows whatever the pinned CLI defaults to.
       ANTHROPIC_MODEL: "claude-opus-5-5"
+      # OpenCode caps one model turn at 32000 output tokens unless told otherwise, and
+      # DeepSeek's reasoning counts against that cap. On Grima#4 both round-1 attempts
+      # spent all 32000 on reasoning and ended `finish=length` with no findings file.
+      # The model itself allows 393216; 64000 keeps the worst-case turn (~120 tokens/s)
+      # inside the default 900 s step budget.
+      OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: "64000"
     # OpenCode has no interactive login: it enables the deepseek provider from
     # DEEPSEEK_API_KEY in the environment. Kept in .env (gitignored), not here.
     # The mapping form because a plain-string entry is mandatory: .env is gitignored and
