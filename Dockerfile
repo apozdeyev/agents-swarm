@@ -85,6 +85,65 @@ old, new = "IDLE_PROMPT_PATTERN = r\"[>❯][\\s\\xa0]\"", "IDLE_PROMPT_PATTERN =
 assert s.count(old) == 1, "claude_code.py no longer has the unpatched pattern: re-check whether this step is still needed"; \
 open(p, "w", encoding="utf-8").write(s.replace(old, new))'
 
+# A step ends on the FIRST COMPLETED read, and every provider shows COMPLETED
+# mid-turn: Codex posts a progress note ("• I found a mismatch: …") with no spinner
+# under it, and that frame reads exactly like a finished reply. One poll landing on
+# it and the agent gets /exit -- 8 of 28 Codex exits on 0.157, a whole review lost
+# when both attempts hit it. Measured over the server logs, the COMPLETED reads that
+# went back to PROCESSING held 1.0s median, 1.4s p90 and 19s max for Codex (126 of
+# 128 under 10s), and at most 3s for Claude. So COMPLETED now has to hold for 10
+# consecutive 1s polls, as IDLE already has to for 3. A COMPLETED read also counts as
+# having seen the agent work: the stable-IDLE exit requires that, and a short turn
+# can finish between two polls, so a real reply that settles from COMPLETED to IDLE
+# would otherwise wait out the whole step budget.
+RUN python -c 'import cli_agent_orchestrator.services.agent_step as m; \
+p = m.__file__; s = open(p, encoding="utf-8").read(); \
+edits = [ \
+  ("_IDLE_STABLE_POLLS = 3\n", "_IDLE_STABLE_POLLS = 3\n_COMPLETED_STABLE_POLLS = 10\n"), \
+  ("    consecutive_idle = 0\n    redeliveries = 0\n", "    consecutive_idle = 0\n    consecutive_completed = 0\n    redeliveries = 0\n"), \
+  ("        if current == TerminalStatus.COMPLETED:\n            return\n        if current == TerminalStatus.IDLE:", \
+   "        if current == TerminalStatus.COMPLETED:\n            observed_working = True\n            consecutive_completed += 1\n            if consecutive_completed >= _COMPLETED_STABLE_POLLS:\n                return\n        else:\n            consecutive_completed = 0\n        if current == TerminalStatus.IDLE:"), \
+]; \
+assert all(s.count(old) == 1 for old, _ in edits), "agent_step.py no longer has the unpatched completion wait: re-check whether this step is still needed"; \
+[s := s.replace(old, new) for old, new in edits]; \
+open(p, "w", encoding="utf-8").write(s)'
+
+# The stable-poll rule above cannot see a status that never moves, and this one does
+# not: StatusMonitor latches the first ready reading until new input is sent, so the
+# ten polls read one cached COMPLETED ten times. On Grima#6 that ended Claude 73 s into
+# reading the diff, Codex 4 s after it started, and the arbiter twice -- 21 of 25
+# Claude COMPLETED statuses in that server's log were followed by nothing but the
+# /exit. Which detector misreads differs by harness and no offline replay settles it,
+# so this does not touch detection. It adds the one signal that does not depend on
+# reading the screen: a working TUI repaints its spinner, an idle one writes nothing.
+# Measured on the pinned CLIs -- gaps between pane chunks while working were at most
+# 0.45 s (Claude), 0.11 s (Codex), and none of the three wrote a byte in two idle
+# minutes (Codex's last repaint lands 6 s after its turn). So a poll only counts
+# toward a stable COMPLETED or IDLE if the pane has been silent for 2 s. The cost is
+# the direction to watch: a TUI that keeps repainting while idle would never count as
+# done and every step would run to its timeout -- re-measure before bumping a CLI pin.
+RUN python -c 'import cli_agent_orchestrator.services.status_monitor as m; \
+p = m.__file__; s = open(p, encoding="utf-8").read(); \
+edits = [ \
+  ("import threading\n", "import threading\nimport time\n"), \
+  ("        self._buffers: Dict[str, str] = {}\n", "        self._buffers: Dict[str, str] = {}\n        self._last_output_at: Dict[str, float] = {}\n"), \
+  ("            self._buffers[terminal_id] = buffer\n", "            self._buffers[terminal_id] = buffer\n            self._last_output_at[terminal_id] = time.monotonic()\n"), \
+  ("    def get_buffer(self, terminal_id: str) -> str:", "    def quiet_for(self, terminal_id: str) -> float:\n        \"\"\"Seconds since the terminal last wrote to its pane.\"\"\"\n        with self._lock:\n            last = self._last_output_at.get(terminal_id)\n        return float(\"inf\") if last is None else time.monotonic() - last\n\n    def get_buffer(self, terminal_id: str) -> str:"), \
+]; \
+assert all(s.count(old) == 1 for old, _ in edits), "status_monitor.py no longer matches: re-check whether this step is still needed"; \
+[s := s.replace(old, new) for old, new in edits]; \
+open(p, "w", encoding="utf-8").write(s)'
+RUN python -c 'import cli_agent_orchestrator.services.agent_step as m; \
+p = m.__file__; s = open(p, encoding="utf-8").read(); \
+edits = [ \
+  ("_COMPLETED_STABLE_POLLS = 10\n", "_COMPLETED_STABLE_POLLS = 10\n_QUIET_BEFORE_DONE = 2.0\n"), \
+  ("        if current == TerminalStatus.COMPLETED:\n            observed_working = True\n            consecutive_completed += 1\n", "        quiet = status_monitor.quiet_for(terminal_id) >= _QUIET_BEFORE_DONE\n        if current == TerminalStatus.COMPLETED:\n            observed_working = True\n            consecutive_completed = consecutive_completed + 1 if quiet else 0\n"), \
+  ("                consecutive_idle += 1\n", "                consecutive_idle = consecutive_idle + 1 if quiet else 0\n"), \
+]; \
+assert all(s.count(old) == 1 for old, _ in edits), "agent_step.py no longer has the patched completion wait: re-check whether this step is still needed"; \
+[s := s.replace(old, new) for old, new in edits]; \
+open(p, "w", encoding="utf-8").write(s)'
+
 RUN useradd --create-home --shell /bin/bash --uid 1000 cao
 
 # A container is always a Claude Code "first run": without this it opens the
