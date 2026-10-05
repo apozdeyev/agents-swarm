@@ -5,6 +5,15 @@ cd "$(dirname "$0")"
 
 C="cao"   # service and container name
 
+# A real one-word request per harness, run inside the container. Not a file test: the
+# credentials file outlives the session it holds, so it was there while every Claude
+# step of Grima#6 answered "Login expired" and the review came back with no report.
+# `codex login status` is no better -- it says "Logged in" over tokens the API rejects
+# with 401. Each probe costs a few seconds and one small request, and Claude's also
+# renews an access token that has run out while the refresh token is still good.
+PROBE_CLAUDE='timeout 60 claude -p ok --model claude-haiku-4-5-20251001 </dev/null >/dev/null 2>&1'
+PROBE_CODEX='timeout 90 codex exec --ephemeral --skip-git-repo-check -s read-only -m gpt-6-astra -c model_reasoning_effort=low ok </dev/null >/dev/null 2>&1'
+
 usage() {
   cat <<'USAGE'
 usage: ./cao <command>
@@ -71,6 +80,13 @@ case "$cmd" in
     esac
     case "$pr" in ''|*[!0-9]*) usage_review ;; esac
     case "$step_timeout" in *[!0-9]*) usage_review ;; esac
+    # Checked before anything is spent: a harness with a dead login ends every one of
+    # its steps `completed` with nothing written, so the run takes its full twenty
+    # minutes to fail, and with Claude out there is no arbiter and no report at all.
+    docker compose exec -T "$C" sh -c "$PROBE_CLAUDE" \
+      || { echo "claude is not logged in: run ./cao login-claude, then retry" >&2; exit 1; }
+    docker compose exec -T "$C" sh -c "$PROBE_CODEX" \
+      || { echo "codex is not logged in: run ./cao login-codex, then retry" >&2; exit 1; }
     # The container has no bind mount, so a report nobody copies out lives only in a
     # volume. Keyed by name and PR, the layout reports/ already holds.
     dest="reports/${repo##*/}/$pr"
@@ -106,8 +122,8 @@ case "$cmd" in
     docker compose exec -T "$C" sh -c '
       echo "user:   $(id -un) (uid $(id -u))"
       echo "tmux:   $(tmux -V)"
-      echo "claude: $(test -f ~/.claude/.credentials.json && echo authenticated || echo "NOT logged in")"
-      echo "codex:  $(test -f ~/.codex/auth.json && echo authenticated || echo "NOT logged in")"
+      echo "claude: $('"$PROBE_CLAUDE"' && echo authenticated || echo "NOT logged in")"
+      echo "codex:  $('"$PROBE_CODEX"' && echo authenticated || echo "NOT logged in")"
       echo "gh:     $(gh auth status >/dev/null 2>&1 && echo authenticated || echo "NOT logged in")"
       echo "opencode: $(test -n "${DEEPSEEK_API_KEY:-}" && echo "DEEPSEEK_API_KEY present" || echo "DEEPSEEK_API_KEY MISSING")"' ;;
   *) usage; [ -z "$cmd" ] && exit 0 || exit 1 ;;
