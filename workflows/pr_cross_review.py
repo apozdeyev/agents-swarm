@@ -571,13 +571,19 @@ def _retried(directory):
     return sorted(os.listdir(directory))
 
 
+# How long _twice keeps looking for a step's file after the step itself has failed, and
+# how often. Two minutes covers the latest arrival seen so far (labels-v2#122).
+LATE_FILE_S = 120
+LATE_FILE_POLL_S = 5
+
+
 def _twice(run, load, step_id, generation, mark, pause=None):
     """Run one step, and run it once more when it delivered nothing.
 
     `run(step_id)` returns None when the step ran and the error text when it did not.
     `load()` returns what the step delivered, or None for "nothing arrived". Returns
     (value, error): value is None when error is set, and when both attempts delivered
-    nothing. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
+    nothing. A step that failed but delivered counts as delivered. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
     id -- what is worth recording is that the step needed one, not which try it was.
 
     `pause()`, when given, is called between the two attempts. Injected rather than
@@ -608,9 +614,27 @@ def _twice(run, load, step_id, generation, mark, pause=None):
     round 1 takes an empty findings list as an answer -- "I looked and found nothing" --
     while for round 2 an empty verdict set means nobody voted.
     """
+    def delivered_or(err):
+        # A step that overran its budget is marked failed, but the harness behind it is
+        # not stopped and keeps writing. Grima#73 lost a complete, valid file written 27 s
+        # before the cutoff and one written 2 s after it; Grima#89 lost one written 9 s
+        # after, when this read the disk once, at the instant of the error; labels-v2#122
+        # one written 2 min after. The file is the deliverable, the step state is not, so
+        # the disk is watched for a while past the error before it counts -- and a
+        # timed-out step that wrote nothing is still not retried, since a second try
+        # starts from zero against a budget the first one has just shown to be too small.
+        deadline = time.monotonic() + LATE_FILE_S
+        while True:
+            value = load()
+            if value is not None:
+                return value, None
+            if time.monotonic() >= deadline:
+                return None, err
+            time.sleep(LATE_FILE_POLL_S)
+
     err = run(step_id)
     if err:
-        return None, err
+        return delivered_or(err)
     value = load()
     if value is not None:
         return value, None
@@ -619,7 +643,7 @@ def _twice(run, load, step_id, generation, mark, pause=None):
         pause()
     err = run("%s-retry-%s" % (step_id, generation))
     if err:
-        return None, err
+        return delivered_or(err)
     return load(), None
 
 
