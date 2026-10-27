@@ -87,6 +87,9 @@ case "$cmd" in
       || { echo "claude is not logged in: run ./cao login-claude, then retry" >&2; exit 1; }
     docker compose exec -T "$C" sh -c "$PROBE_CODEX" \
       || { echo "codex is not logged in: run ./cao login-codex, then retry" >&2; exit 1; }
+    # DeepSeek has no login to expire, but it has queued requests for minutes at a time,
+    # and a review started then overruns every opencode step. The probe says why it failed.
+    docker compose exec -T "$C" cao-deepseek-probe >/dev/null || exit 1
     # The container has no bind mount, so a report nobody copies out lives only in a
     # volume. Keyed by name and PR, the layout reports/ already holds.
     dest="reports/${repo##*/}/$pr"
@@ -125,6 +128,6 @@ case "$cmd" in
       echo "claude: $('"$PROBE_CLAUDE"' && echo authenticated || echo "NOT logged in")"
       echo "codex:  $('"$PROBE_CODEX"' && echo authenticated || echo "NOT logged in")"
       echo "gh:     $(gh auth status >/dev/null 2>&1 && echo authenticated || echo "NOT logged in")"
-      echo "opencode: $(test -n "${DEEPSEEK_API_KEY:-}" && echo "DEEPSEEK_API_KEY present" || echo "DEEPSEEK_API_KEY MISSING")"' ;;
+      echo "opencode: $(cao-deepseek-probe 2>&1)"' ;;
   *) usage; [ -z "$cmd" ] && exit 0 || exit 1 ;;
 esac

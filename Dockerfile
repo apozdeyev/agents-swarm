@@ -155,8 +155,9 @@ RUN mkdir -p /opt/cao \
 COPY profiles/ /opt/cao/profiles/
 COPY workflows/ /opt/cao/workflows/
 COPY bin/cao-trust /usr/local/bin/cao-trust
+COPY bin/cao-deepseek-probe /usr/local/bin/cao-deepseek-probe
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/cao-trust
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/cao-trust /usr/local/bin/cao-deepseek-probe
 
 # Every volume mountpoint must exist in the image owned by cao. Docker seeds an
 # empty named volume from the image path including ownership; if the directory is

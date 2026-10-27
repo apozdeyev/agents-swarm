@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Ask DeepSeek one five-token question and fail unless it answers within 30 seconds.
+
+A key that is present is not an API that works. On 2026-10-15 DeepSeek accepted every
+request at once (HTTP 200 within a second) and then queued it: each turn of the
+opencode steps waited 50 to 280 seconds for its first token, against 2 to 4 seconds
+on every one of the 76 sessions of the three days before, and DeepSeek's own stream
+error read "unable to start processing your request within the 900-second timeout
+limit". Two 30-to-50-minute reviews of Grima#73 were lost that way before anyone
+looked. The check is a request the API must *answer*, not just accept, so the budget
+covers the whole exchange and not the headers.
+
+Exit 0 and the answer time on success; exit 1 and why on anything else.
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+URL = "https://api.deepseek.com/chat/completions"
+MODEL = "deepseek-v4-pro"  # the one profiles/reviewer_opencode.md runs on
+MAX_WAIT_S = 30  # an order of magnitude over normal, a tenth of a queued turn
+
+key = os.environ.get("DEEPSEEK_API_KEY")
+if not key:
+    print("deepseek: DEEPSEEK_API_KEY is not set", file=sys.stderr)
+    sys.exit(1)
+
+body = json.dumps({
+    "model": MODEL,
+    "messages": [{"role": "user", "content": "ok"}],
+    "max_tokens": 5,
+}).encode()
+req = urllib.request.Request(URL, data=body, headers={
+    "Authorization": "Bearer %s" % key,
+    "Content-Type": "application/json",
+})
+
+start = time.monotonic()
+try:
+    with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
+        json.load(resp)
+except urllib.error.HTTPError as exc:
+    print("deepseek: HTTP %d %s" % (exc.code, exc.read(300).decode(errors="replace")),
+          file=sys.stderr)
+    sys.exit(1)
+except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError):
+        print("deepseek: accepted the request but did not answer it in %ds -- their API "
+              "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
+    else:
+        print("deepseek: %s" % reason, file=sys.stderr)
+    sys.exit(1)
+
+print("deepseek: answered in %.1fs" % (time.monotonic() - start))
