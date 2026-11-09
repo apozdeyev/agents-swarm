@@ -115,7 +115,9 @@ case "$cmd" in
     docker compose exec -T "$C" sh -c 'cao-trust /home/cao/workspace /home/cao/workspace/*/'
     docker compose exec "$C" cao launch --agents code_supervisor "$@" ;;
   login-gh)     docker compose exec "$C" sh -c 'gh auth login && gh auth setup-git' ;;
-  login-codex)  docker compose exec "$C" codex login ;;
+  # Device auth: a plain `codex login` serves its callback on localhost:1455 inside the
+  # container, which no browser on the host can reach.
+  login-codex)  docker compose exec "$C" codex login --device-auth ;;
   login-claude) docker compose exec "$C" claude ;;
   login)
     echo "no combined login: use ./cao login-gh, ./cao login-codex or ./cao login-claude" >&2
