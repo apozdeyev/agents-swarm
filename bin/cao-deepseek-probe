@@ -8,12 +8,16 @@ on every one of the 76 sessions of the three days before, and DeepSeek's own str
 error read "unable to start processing your request within the 900-second timeout
 limit". Two 30-to-50-minute reviews of Grima#73 were lost that way before anyone
 looked. The check is a request the API must *answer*, not just accept, so the budget
-covers the whole exchange and not the headers.
+covers the whole exchange and not the headers -- as wall-clock time, by an alarm. The
+socket timeout alone did not: a queued request gets its 200 at once and then a blank
+keep-alive line every few seconds, so no single read ever waits 30 s and the probe sat
+through the whole queue and passed (PR#11 review, finding 2).
 
 Exit 0 and the answer time on success; exit 1 and why on anything else.
 """
 import json
 import os
+import signal
 import sys
 import time
 import urllib.error
@@ -38,6 +42,13 @@ req = urllib.request.Request(URL, data=body, headers={
     "Content-Type": "application/json",
 })
 
+
+def _out_of_time(*_):
+    raise TimeoutError
+
+
+signal.signal(signal.SIGALRM, _out_of_time)
+signal.alarm(MAX_WAIT_S)
 start = time.monotonic()
 try:
     with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
@@ -54,5 +65,6 @@ except (urllib.error.URLError, TimeoutError, OSError) as exc:
     else:
         print("deepseek: %s" % reason, file=sys.stderr)
     sys.exit(1)
+signal.alarm(0)
 
 print("deepseek: answered in %.1fs" % (time.monotonic() - start))
