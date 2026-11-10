@@ -23,9 +23,11 @@ import time
 import urllib.error
 import urllib.request
 
-URL = "https://api.deepseek.com/chat/completions"
+# Both overridable so the test can point this at a local server with a short budget;
+# nothing in the stack sets either.
+URL = os.environ.get("CAO_DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
 MODEL = "deepseek-v4-pro"  # the one profiles/reviewer_opencode.md runs on
-MAX_WAIT_S = 30  # an order of magnitude over normal, a tenth of a queued turn
+MAX_WAIT_S = int(os.environ.get("CAO_DEEPSEEK_WAIT_S", "30"))  # 10x normal, 0.1x a queued turn
 
 key = os.environ.get("DEEPSEEK_API_KEY")
 if not key:
@@ -43,28 +45,45 @@ req = urllib.request.Request(URL, data=body, headers={
 })
 
 
+class _Deadline(Exception):
+    """The alarm. Not a TimeoutError: that is an OSError, and socket.create_connection
+    catches OSError around each address it tries and moves on to the next, which would
+    eat the deadline while connecting and leave the probe with none."""
+
+
 def _out_of_time(*_):
-    raise TimeoutError
+    raise _Deadline
+
+
+def _queued():
+    print("deepseek: accepted the request but did not answer it in %ds -- their API "
+          "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
+    sys.exit(1)
 
 
 signal.signal(signal.SIGALRM, _out_of_time)
 signal.alarm(MAX_WAIT_S)
 start = time.monotonic()
+# Two levels: the error-body read in the HTTPError handler is on the socket too, and an
+# exception raised inside an except clause is not caught by its siblings, so the
+# deadline is caught one level out, where every read sits inside its try.
 try:
-    with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
-        json.load(resp)
-except urllib.error.HTTPError as exc:
-    print("deepseek: HTTP %d %s" % (exc.code, exc.read(300).decode(errors="replace")),
-          file=sys.stderr)
-    sys.exit(1)
-except (urllib.error.URLError, TimeoutError, OSError) as exc:
-    reason = getattr(exc, "reason", exc)
-    if isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError):
-        print("deepseek: accepted the request but did not answer it in %ds -- their API "
-              "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
-    else:
+    try:
+        with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
+            json.load(resp)
+    except urllib.error.HTTPError as exc:
+        print("deepseek: HTTP %d %s" % (exc.code, exc.read(300).decode(errors="replace")),
+              file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, TimeoutError):
+            _queued()
         print("deepseek: %s" % reason, file=sys.stderr)
-    sys.exit(1)
-signal.alarm(0)
+        sys.exit(1)
+except _Deadline:
+    _queued()
+finally:
+    signal.alarm(0)
 
 print("deepseek: answered in %.1fs" % (time.monotonic() - start))
