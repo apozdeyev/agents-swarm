@@ -27,7 +27,20 @@ import urllib.request
 # nothing in the stack sets either.
 URL = os.environ.get("CAO_DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
 MODEL = "deepseek-v4-pro"  # the one profiles/reviewer_opencode.md runs on
-MAX_WAIT_S = int(os.environ.get("CAO_DEEPSEEK_WAIT_S", "30"))  # 10x normal, 0.1x a queued turn
+# Checked, not just converted: a bad value would be a traceback, and 0 would disarm the
+# alarm and make the socket non-blocking -- the one line this prints is the contract.
+# Parsed in a try rather than screened with isdigit(), which passes "²" and then int()
+# raises anyway; and capped, since signal.alarm takes a C int and overflows above it.
+# One name for the cap, so the message reports the bound that is actually checked.
+WAIT_CAP_S = 86400
+try:
+    MAX_WAIT_S = int(os.environ.get("CAO_DEEPSEEK_WAIT_S", "30"))  # 10x normal, 0.1x a queued turn
+except ValueError:
+    MAX_WAIT_S = 0
+if not 1 <= MAX_WAIT_S <= WAIT_CAP_S:
+    print("deepseek: CAO_DEEPSEEK_WAIT_S must be an integer from 1 to %d" % WAIT_CAP_S,
+          file=sys.stderr)
+    sys.exit(1)
 
 key = os.environ.get("DEEPSEEK_API_KEY")
 if not key:
@@ -55,9 +68,24 @@ def _out_of_time(*_):
     raise _Deadline
 
 
-def _queued():
-    print("deepseek: accepted the request but did not answer it in %ds -- their API "
-          "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
+# The response status once there is one. What running out of time means depends on
+# how far the exchange got: no status is a connection or a server that sent nothing,
+# which is not DeepSeek queueing and should not send anyone to wait on DeepSeek; a 200
+# whose body never comes is the queue; an error status whose body never comes is still
+# that error, and the code is worth more than the body it was waiting for.
+status = None
+
+
+def _gave_up():
+    if status is None:
+        print("deepseek: no response in %ds -- could not connect, or nothing was sent "
+              "back" % MAX_WAIT_S, file=sys.stderr)
+    elif status == 200:
+        print("deepseek: accepted the request but did not answer it in %ds -- their API "
+              "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
+    else:
+        print("deepseek: HTTP %d, body not received in %ds" % (status, MAX_WAIT_S),
+              file=sys.stderr)
     sys.exit(1)
 
 
@@ -70,19 +98,21 @@ start = time.monotonic()
 try:
     try:
         with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
+            status = resp.status
             json.load(resp)
     except urllib.error.HTTPError as exc:
+        status = exc.code
         print("deepseek: HTTP %d %s" % (exc.code, exc.read(300).decode(errors="replace")),
               file=sys.stderr)
         sys.exit(1)
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, TimeoutError):
-            _queued()
+            _gave_up()
         print("deepseek: %s" % reason, file=sys.stderr)
         sys.exit(1)
 except _Deadline:
-    _queued()
+    _gave_up()
 finally:
     signal.alarm(0)
 

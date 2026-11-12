@@ -8,6 +8,7 @@ passed through the whole queue once (PR#11 review, finding 2). The server here d
 exactly that, and the probe has to give up on wall-clock time. The budget is overridden
 down to seconds so the suite does not pay the real thirty.
 """
+import ast
 import http.server
 import os
 import socketserver
@@ -67,12 +68,12 @@ class Deadline(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def _probe(self, path):
+    def _probe(self, path, wait=str(WAIT_S), argv=(PROBE,)):
         env = dict(os.environ, DEEPSEEK_API_KEY="test",
                    CAO_DEEPSEEK_URL="http://127.0.0.1:%d%s" % (self.port, path),
-                   CAO_DEEPSEEK_WAIT_S=str(WAIT_S))
+                   CAO_DEEPSEEK_WAIT_S=wait)
         start = time.monotonic()
-        done = subprocess.run([sys.executable, PROBE], env=env, capture_output=True,
+        done = subprocess.run([sys.executable, *argv], env=env, capture_output=True,
                               text=True, timeout=WAIT_S * 5)
         return done, time.monotonic() - start
 
@@ -83,12 +84,27 @@ class Deadline(unittest.TestCase):
         self.assertNotIn("Traceback", done.stderr)
         self.assertLess(took, WAIT_S + 2)
 
-    def test_an_error_whose_body_never_arrives_still_gets_the_one_line_diagnostic(self):
+    def test_an_error_whose_body_never_arrives_is_still_reported_as_that_error(self):
         """The error-body read is a socket read too, inside an except clause, where the
-        deadline is not caught by that clause's siblings."""
+        deadline is not caught by that clause's siblings -- and the status it already
+        has is the diagnostic, not the queueing message."""
         done, took = self._probe("/error")
         self.assertEqual(done.returncode, 1, done.stderr)
-        self.assertTrue(done.stderr.startswith("deepseek: "), done.stderr)
+        self.assertIn("HTTP 500", done.stderr)
+        self.assertNotIn("queueing", done.stderr)
+        self.assertNotIn("Traceback", done.stderr)
+        self.assertLess(took, WAIT_S + 2)
+
+    def test_a_connect_that_never_completes_is_not_called_queueing(self):
+        """The deadline in the connect phase, where no request has been sent. The probe
+        is run under a socket.create_connection that sleeps past the budget."""
+        stall = ("import runpy, socket, sys, time\n"
+                 "socket.create_connection = lambda *a, **k: time.sleep(%d)\n"
+                 "runpy.run_path(sys.argv[1], run_name='__main__')" % (WAIT_S * 4))
+        done, took = self._probe("/answer", argv=("-c", stall, PROBE))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("no response in %ds" % WAIT_S, done.stderr)
+        self.assertNotIn("queueing", done.stderr)
         self.assertNotIn("Traceback", done.stderr)
         self.assertLess(took, WAIT_S + 2)
 
@@ -96,6 +112,40 @@ class Deadline(unittest.TestCase):
         done, _ = self._probe("/answer")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("answered in", done.stdout)
+
+    def test_a_bad_budget_is_refused_in_one_line(self):
+        """int() at module level was a traceback, and 0 disarmed the alarm. "²" passes
+        isdigit() and fails int(); 99999999999 overflows signal.alarm's C int."""
+        for bad in ("", "abc", "1.5", "0", "-5", "²", "99999999999", "86401"):
+            with self.subTest(bad=bad):
+                done, _ = self._probe("/answer", wait=bad)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn("CAO_DEEPSEEK_WAIT_S", done.stderr)
+                # The line is the contract, so it names the real bound, not "positive".
+                self.assertIn("86400", done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+
+    def test_the_cap_itself_is_a_valid_budget(self):
+        """The bound the message names is the bound the check applies: 86401 is refused
+        above, and this passes. The stub answers at once, so nothing waits a day."""
+        done, _ = self._probe("/answer", wait="86400")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class DeadlineClass(unittest.TestCase):
+
+    def test_the_deadline_is_not_an_os_error(self):
+        """socket.create_connection catches OSError around each address it tries and
+        moves on, which would eat the alarm's exception mid-connect and spend the
+        one-shot alarm. Loopback never blocks in connect, so no run-time test sees
+        this; the class's bases are read instead. `_Deadline(TimeoutError)` would pass
+        every other test here and bring the bug back."""
+        with open(PROBE) as src:
+            tree = ast.parse(src.read())
+        classes = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.ClassDef) and n.name == "_Deadline"]
+        self.assertEqual(len(classes), 1)
+        self.assertEqual([getattr(b, "id", None) for b in classes[0].bases], ["Exception"])
 
 
 if __name__ == "__main__":
