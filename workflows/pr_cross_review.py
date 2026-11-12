@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from cao_workflow import ShimError, ShimHTTPError, emit_output, get_inputs, step
@@ -526,7 +527,7 @@ def _arbiter_artifacts(art, findings, failures):
     return os.path.join(art, "final-review-%s.md" % digest), "arbiter-%s" % digest
 
 
-def _arbitrate(run, report, final, step_id, generation, mark):
+def _arbitrate(run, report, final, step_id, generation, mark, pause=None):
     """Drive the last stage: run it, check what it actually wrote, publish that.
 
     Returns (published, error). `published` is `final` when this execution's report passed
@@ -545,7 +546,7 @@ def _arbitrate(run, report, final, step_id, generation, mark):
     defect in, and it had never been reachable by a test.
     """
     written, err = _twice(run, lambda: report if _report_is_usable(report) else None,
-                          step_id, generation, mark)
+                          step_id, generation, mark, pause)
     if err:
         return None, err
     if written is None:
@@ -570,14 +571,26 @@ def _retried(directory):
     return sorted(os.listdir(directory))
 
 
-def _twice(run, load, step_id, generation, mark):
+# How long _twice keeps looking for a step's file after the step itself has failed, and
+# how often. Two minutes covers the latest arrival seen so far (labels-v2#122).
+LATE_FILE_S = 120
+LATE_FILE_POLL_S = 5
+
+
+def _twice(run, load, step_id, generation, mark, pause=None):
     """Run one step, and run it once more when it delivered nothing.
 
     `run(step_id)` returns None when the step ran and the error text when it did not.
     `load()` returns what the step delivered, or None for "nothing arrived". Returns
     (value, error): value is None when error is set, and when both attempts delivered
-    nothing. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
+    nothing. A step that failed but delivered counts as delivered. `mark(step_id)` is called before a second attempt, once, with the ORIGINAL
     id -- what is worth recording is that the step needed one, not which try it was.
+
+    `pause()`, when given, is called between the two attempts. Injected rather than
+    slept here for the reason `run`, `load` and `mark` are: this stays a pure function
+    of its arguments, and a caller with nothing to wait for passes nothing. What it is
+    for is under _api_backoff -- a retry that starts while the cause of the first
+    failure is still live is not a second chance.
 
     Why a step that came back `completed` is run again at all: CAO ends a step on ONE
     reading of COMPLETED and nothing else (`services/agent_step.py` -- its IDLE exit
@@ -601,20 +614,65 @@ def _twice(run, load, step_id, generation, mark):
     round 1 takes an empty findings list as an answer -- "I looked and found nothing" --
     while for round 2 an empty verdict set means nobody voted.
     """
+    def delivered_or(err):
+        # A step that overran its budget is marked failed, but the harness behind it is
+        # not stopped and keeps writing. Grima#73 lost a complete, valid file written 27 s
+        # before the cutoff and one written 2 s after it; Grima#89 lost one written 9 s
+        # after, when this read the disk once, at the instant of the error; labels-v2#122
+        # one written 2 min after. The file is the deliverable, the step state is not, so
+        # the disk is watched for a while past the error before it counts -- and a
+        # timed-out step that wrote nothing is still not retried, since a second try
+        # starts from zero against a budget the first one has just shown to be too small.
+        deadline = time.monotonic() + LATE_FILE_S
+        while True:
+            value = load()
+            if value is not None:
+                return value, None
+            if time.monotonic() >= deadline:
+                return None, err
+            time.sleep(LATE_FILE_POLL_S)
+
     err = run(step_id)
     if err:
-        return None, err
+        return delivered_or(err)
     value = load()
     if value is not None:
         return value, None
     mark(step_id)
+    if pause:
+        pause()
     err = run("%s-retry-%s" % (step_id, generation))
     if err:
-        return None, err
+        return delivered_or(err)
     return load(), None
 
 
-# Everything above this line is pure: no network, no filesystem, no clock. Everything
+# Claude Code answers an unreachable API with "Waiting for API response - will retry in
+# 2m 40s" and keeps the pane alive. CAO reads that stalled frame as a finished turn, so
+# the step ends `completed` with nothing written -- and the retry then fired 19 seconds
+# later, into the same dead window, and spent the only other attempt for nothing
+# (Palantir#3, round 2, 2026-09-26; the same stall took both round-1 attempts on
+# metrics-hub#299 the day before). Outlasting the harness's own backoff is what makes
+# the second attempt a second chance. Only Claude steps wait: Codex's teardowns are a
+# usage limit that resets in days and a misread startup frame, and OpenCode's is plain
+# slowness -- none of them is a window that closes in three minutes, so paying it there
+# would be dead time on every run. Nothing branches on the clock; a resume still takes
+# the same path.
+API_BACKOFF_S = 180
+
+
+def _api_backoff():
+    time.sleep(API_BACKOFF_S)
+
+
+def _backoff_for(provider):
+    """The pause to put between two attempts of a step on `provider`, or None."""
+    return _api_backoff if provider == "claude_code" else None
+
+
+# Everything above this line is pure: no network, no filesystem, and no clock READ --
+# `_api_backoff` sleeps, which costs time without telling anything apart, so a resume
+# still takes the same path through this half. Everything
 # below clones a repository and drives three model harnesses. CAO runs this file as a
 # script (`python pr_cross_review.py`, its own process), so the guard fires only for
 # tests/test_pr_cross_review.py, which loads the module for the helpers above and
@@ -890,7 +948,8 @@ def _review(spec):
     found, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
                         lambda: _load_round1(out, key),
                         "r1-%s" % key, GENERATION,
-                        lambda step_id: _mark_retried(RETRIED, step_id))
+                        lambda step_id: _mark_retried(RETRIED, step_id),
+                        _backoff_for(provider))
     if err:
         return key, [], err
     if found is None:
@@ -952,26 +1011,26 @@ if len([f for f in deduped if not f["corroborated"]]) > 1:
         "Raw JSON only, no code fences. An empty merges list is a valid answer. "
         "Reply with just the path when done."
     ) % (candidates, merges_out)
-    try:
-        step("claude_code", "reviewer", merge_prompt,
-             recovery="idempotent", step_id=_merge_step, timeout=TIMEOUT,
-             working_directory=REPO, allowed_tools=WRITE_TOOLS)
-        # The one stage that was not verified on disk. Every other agent step checks
-        # its artifact because a step can return `completed` having written nothing --
-        # and here that came back indistinguishable from an honest {"merges": []}, so
-        # the dedup silently did nothing, near-duplicates went separately through round
-        # 2 and into the report, and the arbiter was never told.
-        _groups = _read_items(merges_out, "merges")
-        if _groups is None:
-            failures["merge-semantic"] = "no usable merge file at %s" % merges_out
-        else:
-            deduped = _mark_clusters(deduped, _groups)
-    except ShimHTTPError as exc:
-        if getattr(exc, "status", None) == 409:
-            raise
-        failures["merge-semantic"] = str(exc)
-    except ShimError as exc:
-        failures["merge-semantic"] = str(exc)
+    # Verified on disk and given a second attempt, like every other agent step. It was
+    # the one stage with neither. Unverified, a `completed` that had written nothing
+    # passed for an honest {"merges": []}, so near-duplicates went separately through
+    # round 2 and the arbiter was never told. Verified but not retried, one premature
+    # COMPLETED -- the pane torn down 17s in, the model still reading its one file --
+    # was the only failure of a run whose two other tear-downs, in round 1 and at the
+    # arbiter, were both repaired by their retry. `_read_items` already draws the line
+    # _twice needs: None for nothing written, [] for "no duplicates found".
+    _groups, _merge_err = _twice(
+        lambda step_id: _step_or_error("claude_code", "reviewer", merge_prompt, step_id),
+        lambda: _read_items(merges_out, "merges"),
+        _merge_step, GENERATION,
+        lambda step_id: _mark_retried(RETRIED, step_id),
+        _backoff_for("claude_code"))
+    if _merge_err:
+        failures["merge-semantic"] = _merge_err
+    elif _groups is None:
+        failures["merge-semantic"] = "no usable merge file at %s" % merges_out
+    else:
+        deduped = _mark_clusters(deduped, _groups)
 
 # `corroborated` was set in `_dedup`, off round 1 alone: found independently by two or
 # more harnesses IS the cross-confirmation round 2 exists to produce, so such a finding
@@ -1065,7 +1124,8 @@ def _validate(spec):
     ruled, err = _twice(lambda step_id: _step_or_error(provider, agent, prompt, step_id),
                         lambda: _ruled() or None,
                         jury_step, GENERATION,
-                        lambda step_id: _mark_retried(RETRIED, step_id))
+                        lambda step_id: _mark_retried(RETRIED, step_id),
+                        _backoff_for(provider))
     if err:
         return key, {}, err
     if ruled is None:
@@ -1158,7 +1218,8 @@ _arbiter_prompt = ARBITER_PROMPT % (PR, REPO, MERGED, DIFF, META, _arbiter_repor
 REPORT, _arbiter_err = _arbitrate(
     lambda step_id: _step_or_error("claude_code", "developer", _arbiter_prompt, step_id),
     _arbiter_report, FINAL, _arbiter_step, GENERATION,
-    lambda step_id: _mark_retried(RETRIED, step_id))
+    lambda step_id: _mark_retried(RETRIED, step_id),
+    _backoff_for("claude_code"))
 if _arbiter_err:
     failures["arbiter"] = _arbiter_err
 

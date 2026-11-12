@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Ask DeepSeek one five-token question and fail unless it answers within 30 seconds.
+
+A key that is present is not an API that works. On 2026-10-15 DeepSeek accepted every
+request at once (HTTP 200 within a second) and then queued it: each turn of the
+opencode steps waited 50 to 280 seconds for its first token, against 2 to 4 seconds
+on every one of the 76 sessions of the three days before, and DeepSeek's own stream
+error read "unable to start processing your request within the 900-second timeout
+limit". Two 30-to-50-minute reviews of Grima#73 were lost that way before anyone
+looked. The check is a request the API must *answer*, not just accept, so the budget
+covers the whole exchange and not the headers -- as wall-clock time, by an alarm. The
+socket timeout alone did not: a queued request gets its 200 at once and then a blank
+keep-alive line every few seconds, so no single read ever waits 30 s and the probe sat
+through the whole queue and passed (PR#11 review, finding 2).
+
+Exit 0 and the answer time on success; exit 1 and why on anything else.
+"""
+import json
+import os
+import signal
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# Both overridable so the test can point this at a local server with a short budget;
+# nothing in the stack sets either.
+URL = os.environ.get("CAO_DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
+MODEL = "deepseek-v4-pro"  # the one profiles/reviewer_opencode.md runs on
+# Checked, not just converted: a bad value would be a traceback, and 0 would disarm the
+# alarm and make the socket non-blocking -- the one line this prints is the contract.
+# Parsed in a try rather than screened with isdigit(), which passes "²" and then int()
+# raises anyway; and capped, since signal.alarm takes a C int and overflows above it.
+# One name for the cap, so the message reports the bound that is actually checked.
+WAIT_CAP_S = 86400
+try:
+    MAX_WAIT_S = int(os.environ.get("CAO_DEEPSEEK_WAIT_S", "30"))  # 10x normal, 0.1x a queued turn
+except ValueError:
+    MAX_WAIT_S = 0
+if not 1 <= MAX_WAIT_S <= WAIT_CAP_S:
+    print("deepseek: CAO_DEEPSEEK_WAIT_S must be an integer from 1 to %d" % WAIT_CAP_S,
+          file=sys.stderr)
+    sys.exit(1)
+
+key = os.environ.get("DEEPSEEK_API_KEY")
+if not key:
+    print("deepseek: DEEPSEEK_API_KEY is not set", file=sys.stderr)
+    sys.exit(1)
+
+body = json.dumps({
+    "model": MODEL,
+    "messages": [{"role": "user", "content": "ok"}],
+    "max_tokens": 5,
+}).encode()
+req = urllib.request.Request(URL, data=body, headers={
+    "Authorization": "Bearer %s" % key,
+    "Content-Type": "application/json",
+})
+
+
+class _Deadline(Exception):
+    """The alarm. Not a TimeoutError: that is an OSError, and socket.create_connection
+    catches OSError around each address it tries and moves on to the next, which would
+    eat the deadline while connecting and leave the probe with none."""
+
+
+def _out_of_time(*_):
+    raise _Deadline
+
+
+# The response status once there is one. What running out of time means depends on
+# how far the exchange got: no status is a connection or a server that sent nothing,
+# which is not DeepSeek queueing and should not send anyone to wait on DeepSeek; a 200
+# whose body never comes is the queue; an error status whose body never comes is still
+# that error, and the code is worth more than the body it was waiting for.
+status = None
+
+
+def _gave_up():
+    if status is None:
+        print("deepseek: no response in %ds -- could not connect, or nothing was sent "
+              "back" % MAX_WAIT_S, file=sys.stderr)
+    elif status == 200:
+        print("deepseek: accepted the request but did not answer it in %ds -- their API "
+              "is queueing; retry later" % MAX_WAIT_S, file=sys.stderr)
+    else:
+        print("deepseek: HTTP %d, body not received in %ds" % (status, MAX_WAIT_S),
+              file=sys.stderr)
+    sys.exit(1)
+
+
+signal.signal(signal.SIGALRM, _out_of_time)
+signal.alarm(MAX_WAIT_S)
+start = time.monotonic()
+# Two levels: the error-body read in the HTTPError handler is on the socket too, and an
+# exception raised inside an except clause is not caught by its siblings, so the
+# deadline is caught one level out, where every read sits inside its try.
+try:
+    try:
+        with urllib.request.urlopen(req, timeout=MAX_WAIT_S) as resp:
+            status = resp.status
+            json.load(resp)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        print("deepseek: HTTP %d %s" % (exc.code, exc.read(300).decode(errors="replace")),
+              file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, TimeoutError):
+            _gave_up()
+        print("deepseek: %s" % reason, file=sys.stderr)
+        sys.exit(1)
+except _Deadline:
+    _gave_up()
+finally:
+    signal.alarm(0)
+
+print("deepseek: answered in %.1fs" % (time.monotonic() - start))
