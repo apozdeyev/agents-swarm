@@ -114,13 +114,22 @@ class Deadline(unittest.TestCase):
         self.assertIn("answered in", done.stdout)
 
     def test_a_bad_budget_is_refused_in_one_line(self):
-        """int() at module level was a traceback, and 0 disarmed the alarm."""
-        for bad in ("", "abc", "1.5", "0", "-5"):
+        """int() at module level was a traceback, and 0 disarmed the alarm. "²" passes
+        isdigit() and fails int(); 99999999999 overflows signal.alarm's C int."""
+        for bad in ("", "abc", "1.5", "0", "-5", "²", "99999999999", "86401"):
             with self.subTest(bad=bad):
                 done, _ = self._probe("/answer", wait=bad)
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertIn("CAO_DEEPSEEK_WAIT_S", done.stderr)
+                # The line is the contract, so it names the real bound, not "positive".
+                self.assertIn("86400", done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
+
+    def test_the_cap_itself_is_a_valid_budget(self):
+        """The bound the message names is the bound the check applies: 86401 is refused
+        above, and this passes. The stub answers at once, so nothing waits a day."""
+        done, _ = self._probe("/answer", wait="86400")
+        self.assertEqual(done.returncode, 0, done.stderr)
 
 
 class DeadlineClass(unittest.TestCase):
