@@ -114,8 +114,9 @@ class Deadline(unittest.TestCase):
         self.assertIn("answered in", done.stdout)
 
     def test_a_bad_budget_is_refused_in_one_line(self):
-        """int() at module level was a traceback, and 0 disarmed the alarm."""
-        for bad in ("", "abc", "1.5", "0", "-5"):
+        """int() at module level was a traceback, and 0 disarmed the alarm. "²" passes
+        isdigit() and fails int(); 99999999999 overflows signal.alarm's C int."""
+        for bad in ("", "abc", "1.5", "0", "-5", "²", "99999999999"):
             with self.subTest(bad=bad):
                 done, _ = self._probe("/answer", wait=bad)
                 self.assertEqual(done.returncode, 1, done.stderr)
