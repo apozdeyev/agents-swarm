@@ -31,12 +31,15 @@ MODEL = "deepseek-v4-pro"  # the one profiles/reviewer_opencode.md runs on
 # alarm and make the socket non-blocking -- the one line this prints is the contract.
 # Parsed in a try rather than screened with isdigit(), which passes "²" and then int()
 # raises anyway; and capped, since signal.alarm takes a C int and overflows above it.
+# One name for the cap, so the message reports the bound that is actually checked.
+WAIT_CAP_S = 86400
 try:
     MAX_WAIT_S = int(os.environ.get("CAO_DEEPSEEK_WAIT_S", "30"))  # 10x normal, 0.1x a queued turn
 except ValueError:
     MAX_WAIT_S = 0
-if not 1 <= MAX_WAIT_S <= 86400:
-    print("deepseek: CAO_DEEPSEEK_WAIT_S must be a positive integer", file=sys.stderr)
+if not 1 <= MAX_WAIT_S <= WAIT_CAP_S:
+    print("deepseek: CAO_DEEPSEEK_WAIT_S must be an integer from 1 to %d" % WAIT_CAP_S,
+          file=sys.stderr)
     sys.exit(1)
 
 key = os.environ.get("DEEPSEEK_API_KEY")
