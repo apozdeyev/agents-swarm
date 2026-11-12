@@ -121,6 +121,8 @@ class Deadline(unittest.TestCase):
                 done, _ = self._probe("/answer", wait=bad)
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertIn("CAO_DEEPSEEK_WAIT_S", done.stderr)
+                # The line is the contract, so it names the real bound, not "positive".
+                self.assertIn("86400", done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
 
 

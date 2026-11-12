@@ -36,7 +36,7 @@ try:
 except ValueError:
     MAX_WAIT_S = 0
 if not 1 <= MAX_WAIT_S <= 86400:
-    print("deepseek: CAO_DEEPSEEK_WAIT_S must be a positive integer", file=sys.stderr)
+    print("deepseek: CAO_DEEPSEEK_WAIT_S must be an integer from 1 to 86400", file=sys.stderr)
     sys.exit(1)
 
 key = os.environ.get("DEEPSEEK_API_KEY")
